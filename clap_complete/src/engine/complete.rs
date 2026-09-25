@@ -63,9 +63,17 @@ pub fn complete(
 
         if let Ok(value) = arg.to_value() {
             if let Some(next_cmd) = current_cmd.find_subcommand(value) {
+                // Global arguments remain in scope in every subcommand, so
+                // conflicts they introduce (and conflicts with them) must keep
+                // applying after descending. Non-global arguments are reset.
+                used_args.retain(|id| {
+                    current_cmd
+                        .get_arguments()
+                        .find(|a| a.get_id() == id)
+                        .is_some_and(|a| a.is_global_set())
+                });
                 current_cmd = next_cmd;
                 pos_index = 1;
-                used_args.clear();
                 continue;
             }
         }

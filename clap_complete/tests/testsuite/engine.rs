@@ -1595,6 +1595,248 @@ fn hidden_alias_shares_conflicts() {
     assert_eq!(completions, ["--verbose", "--quiet"]);
 }
 
+/// A `tool remote fetch` hierarchy exercising global options with conflicts
+/// that cross command layers:
+/// - `--profile`/`-p` (values `prod`/`dev`) conflicts with `--offline`/`-o`
+/// - `--token`/`-t` conflicts with `--verbose`/`-v`
+/// - fetch-local `--plain`/`-P` conflicts with the global `--offline`
+/// - fetch-local `--stream`/`-s` conflicts with the global `--profile`
+fn global_tool_cmd() -> Command {
+    Command::new("tool")
+        .disable_help_flag(true)
+        .disable_version_flag(true)
+        .arg(
+            clap::Arg::new("profile")
+                .long("profile")
+                .short('p')
+                .value_parser(["prod", "dev"])
+                .global(true),
+        )
+        .arg(
+            clap::Arg::new("offline")
+                .long("offline")
+                .short('o')
+                .action(clap::ArgAction::SetTrue)
+                .global(true)
+                .conflicts_with("profile"),
+        )
+        .arg(
+            clap::Arg::new("token")
+                .long("token")
+                .short('t')
+                .global(true),
+        )
+        .arg(
+            clap::Arg::new("verbose")
+                .long("verbose")
+                .short('v')
+                .action(clap::ArgAction::SetTrue)
+                .global(true)
+                .conflicts_with("token"),
+        )
+        .subcommand(
+            Command::new("remote")
+                .disable_help_flag(true)
+                .disable_version_flag(true)
+                .subcommand(
+                    Command::new("fetch")
+                        .disable_help_flag(true)
+                        .disable_version_flag(true)
+                        .arg(
+                            clap::Arg::new("plain")
+                                .long("plain")
+                                .short('P')
+                                .action(clap::ArgAction::SetTrue)
+                                .conflicts_with("offline"),
+                        )
+                        .arg(
+                            clap::Arg::new("stream")
+                                .long("stream")
+                                .short('s')
+                                .action(clap::ArgAction::SetTrue)
+                                .conflicts_with("profile"),
+                        ),
+                ),
+        )
+}
+
+fn complete_global_tool(args: &[&str]) -> Vec<String> {
+    let mut cmd = global_tool_cmd();
+    let args: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
+    let arg_index = args.len() - 1;
+    clap_complete::engine::complete(&mut cmd, args, arg_index, None)
+        .unwrap()
+        .into_iter()
+        .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+        .collect()
+}
+
+#[test]
+fn global_conflict_filters_candidates_in_subcommand() {
+    // A global option set before descending must still exclude its conflicts
+    // (and the option conflicting with it) deep inside the subcommand, while
+    // unrelated options such as `--plain` and `--token` survive.
+    for args in [
+        vec!["tool", "-p", "prod", "remote", "fetch", ""],
+        vec!["tool", "-p=prod", "remote", "fetch", ""],
+        vec!["tool", "--profile", "prod", "remote", "fetch", ""],
+        vec!["tool", "--profile=prod", "remote", "fetch", ""],
+    ] {
+        let completions = complete_global_tool(&args);
+        assert!(
+            !completions.contains(&"--offline".to_owned()),
+            "offline must be excluded for {args:?}, got {completions:?}"
+        );
+        assert!(
+            !completions.contains(&"--stream".to_owned()),
+            "stream must be excluded for {args:?}, got {completions:?}"
+        );
+        assert!(completions.contains(&"--plain".to_owned()));
+        assert!(completions.contains(&"--token".to_owned()));
+        assert!(completions.contains(&"--verbose".to_owned()));
+        // Exact ordering, grouping and de-duplication stay intact; the short
+        // and long spellings, as well as space and `=` value forms, must not
+        // produce duplicate candidates.
+        assert_eq!(
+            completions,
+            ["--plain", "--profile", "--token", "--verbose"],
+            "mismatch for {args:?}"
+        );
+    }
+}
+
+#[test]
+fn global_option_value_position_completes_only_values() {
+    // Space-separated value position: matching possible value only.
+    assert_eq!(complete_global_tool(&["tool", "-p", "pr"]), ["prod"]);
+    assert_eq!(
+        complete_global_tool(&["tool", "-p", ""]),
+        ["prod", "dev"]
+    );
+    assert_eq!(complete_global_tool(&["tool", "-p", "d"]), ["dev"]);
+
+    // `=`-attached value position: same matching, prefix-preserving value.
+    assert_eq!(complete_global_tool(&["tool", "-p=pr"]), ["-p=prod"]);
+    assert_eq!(
+        complete_global_tool(&["tool", "-p="]),
+        ["-p=prod", "-p=dev"]
+    );
+
+    // No matching prefix is a successful, empty completion.
+    assert!(complete_global_tool(&["tool", "-p", "zzz"]).is_empty());
+    assert!(complete_global_tool(&["tool", "-p=zzz"]).is_empty());
+}
+
+#[test]
+fn option_value_position_does_not_fall_back() {
+    // At an option's value position, neither flags nor positional arguments
+    // may leak in, regardless of the spelling.
+    let mut cmd = Command::new("pv")
+        .disable_help_flag(true)
+        .disable_version_flag(true)
+        .arg(
+            clap::Arg::new("profile")
+                .long("profile")
+                .short('p')
+                .value_parser(["prod", "dev"]),
+        )
+        .arg(clap::Arg::new("pos").value_parser(["alpha", "beta"]));
+
+    let mut complete = |args: &[&str]| -> Vec<String> {
+        let args: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
+        let arg_index = args.len() - 1;
+        clap_complete::engine::complete(&mut cmd, args, arg_index, None)
+            .unwrap()
+            .into_iter()
+            .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+            .collect()
+    };
+
+    // Baseline: positionals and the option are offered together.
+    assert_eq!(complete(&["pv", ""]), ["alpha", "beta", "--profile"]);
+    // A bare prefix still completes the positional.
+    assert_eq!(complete(&["pv", "al"]), ["alpha"]);
+    // But the same prefix in `-p`'s value position yields nothing rather
+    // than falling back to the positional or to option completion.
+    assert!(complete(&["pv", "-p", "al"]).is_empty());
+    assert!(complete(&["pv", "-p=al"]).is_empty());
+    assert_eq!(complete(&["pv", "-p", "pr"]), ["prod"]);
+    assert_eq!(complete(&["pv", "-p=pr"]), ["-p=prod"]);
+}
+
+#[test]
+fn clustered_short_flags_expand_for_conflicts() {
+    // `-vP` expands to the global `verbose` and the fetch-local `plain`.
+    // `verbose` excludes `token`, `plain` excludes the global `offline`;
+    // the unrelated `--stream` candidate must remain.
+    let completions = complete_global_tool(&["tool", "remote", "fetch", "-vP", ""]);
+    assert!(!completions.contains(&"--token".to_owned()));
+    assert!(!completions.contains(&"--offline".to_owned()));
+    assert!(completions.contains(&"--plain".to_owned()));
+    assert!(completions.contains(&"--stream".to_owned()));
+    assert!(completions.contains(&"--verbose".to_owned()));
+    assert_eq!(
+        completions,
+        ["--plain", "--profile", "--stream", "--verbose"]
+    );
+}
+
+#[test]
+fn conflicting_prior_args_still_complete_successfully() {
+    // The command line already holds the conflicting pair `profile`+`stream`.
+    // Completion must succeed and only drop candidates excluded by one of the
+    // present options: `offline` and `stream` (both conflict with `profile`),
+    // while `plain`/`token`/`verbose` stay.
+    let completions =
+        complete_global_tool(&["tool", "-p", "prod", "remote", "fetch", "-s", ""]);
+    assert_eq!(completions, ["--plain", "--token", "--verbose"]);
+}
+
+#[test]
+fn subcommand_local_and_global_conflicts_are_bidirectional() {
+    // Global `offline` present excludes the fetch-local `plain`, but not the
+    // unrelated `stream` (which conflicts with `profile`, not `offline`).
+    assert_eq!(
+        complete_global_tool(&["tool", "remote", "fetch", "-o", ""]),
+        ["--stream", "--offline", "--token", "--verbose"]
+    );
+
+    // Fetch-local `stream` only conflicts with `profile`; `offline` survives.
+    assert_eq!(
+        complete_global_tool(&["tool", "remote", "fetch", "-s", ""]),
+        ["--plain", "--stream", "--offline", "--token", "--verbose"]
+    );
+
+    // Fetch-local `plain` excludes global `offline`.
+    assert_eq!(
+        complete_global_tool(&["tool", "remote", "fetch", "-P", ""]),
+        ["--plain", "--profile", "--stream", "--token", "--verbose"]
+    );
+
+    // An outright illegal combination (`offline` + `profile`) still completes
+    // successfully with only the mutually-reachable options left.
+    let completions =
+        complete_global_tool(&["tool", "-o", "-p", "prod", "remote", "fetch", ""]);
+    assert_eq!(completions, ["--token", "--verbose"]);
+}
+
+#[test]
+fn global_conflicts_leave_subcommand_completion_intact() {
+    // Subcommand completion follows its original behavior, with global
+    // options on the line not interfering.
+    assert_eq!(
+        complete_global_tool(&["tool", "-p", "prod", "remote", "fe"]),
+        ["fetch"]
+    );
+    // A non-matching subcommand prefix is an empty, successful completion.
+    assert!(complete_global_tool(&["tool", "remx"]).is_empty());
+    // A non-matching option prefix after conflicts are in play is likewise
+    // an empty, successful completion.
+    assert!(
+        complete_global_tool(&["tool", "-p", "prod", "remote", "fetch", "--zzz"]).is_empty()
+    );
+}
+
 #[test]
 fn sort_and_filter() {
     let mut cmd = Command::new("exhaustive")
