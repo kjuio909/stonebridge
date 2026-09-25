@@ -41,6 +41,7 @@ pub fn complete(
     let mut pos_index = 1;
     let mut is_escaped = false;
     let mut next_state = ParseState::ValueDone;
+    let mut seen_args = Vec::<clap::Id>::new();
     while let Some(arg) = raw_args.next(&mut cursor) {
         let current_state = next_state;
         next_state = ParseState::ValueDone;
@@ -49,14 +50,15 @@ pub fn complete(
             arg.to_value_os(),
         );
         if cursor == target_cursor {
-            return complete_arg(
+            let completions = complete_arg(
                 &arg,
                 current_cmd,
                 current_dir,
                 pos_index,
                 is_escaped,
                 current_state,
-            );
+            )?;
+            return Ok(filter_conflicting(current_cmd, &seen_args, completions));
         }
 
         if let Ok(value) = arg.to_value() {
@@ -88,8 +90,16 @@ pub fn complete(
                     });
                     is_find.unwrap_or(false)
                 });
+                let opt = opt.or_else(|| {
+                    current_cmd.get_arguments().find(|a| {
+                        a.get_aliases()
+                            .map(|aliases| aliases.contains(&flag))
+                            .unwrap_or(false)
+                    })
+                });
 
                 if let Some(opt) = opt {
+                    seen_args.push(opt.get_id().clone());
                     if opt.get_num_args().expect("built").takes_values() && value.is_none() {
                         next_state = ParseState::Opt((opt, 1));
                     };
@@ -99,7 +109,9 @@ pub fn complete(
                 }
             }
         } else if let Some(short) = arg.to_short() {
-            let (_, takes_value_opt, mut short) = parse_shortflags(current_cmd, short);
+            let (_, matched_flags, takes_value_opt, mut short) =
+                parse_shortflags(current_cmd, short);
+            seen_args.extend(matched_flags.iter().map(|arg| arg.get_id().clone()));
             if let Some(opt) = takes_value_opt {
                 if short.next_value_os().is_none() {
                     next_state = ParseState::Opt((opt, 1));
@@ -243,6 +255,52 @@ fn complete_arg(
     Ok(completions)
 }
 
+/// Remove candidates for arguments that conflict with arguments already
+/// present on the command line.
+///
+/// Conflicts are honored no matter which side of the relationship declared
+/// them: a candidate is dropped when an argument seen on the command line
+/// declares a conflict with it, or when the candidate's argument declares a
+/// conflict with a seen argument.  Arguments that do not conflict, including
+/// the seen arguments themselves, are left untouched.
+fn filter_conflicting(
+    cmd: &clap::Command,
+    seen_args: &[clap::Id],
+    completions: Vec<CompletionCandidate>,
+) -> Vec<CompletionCandidate> {
+    if seen_args.is_empty() {
+        return completions;
+    }
+
+    let mut conflicting = std::collections::HashSet::new();
+    for arg in cmd.get_arguments() {
+        let conflicts = cmd.get_arg_conflicts_with(arg);
+        if seen_args.iter().any(|id| id == arg.get_id()) {
+            conflicting.extend(conflicts.iter().map(|a| a.get_id().clone()));
+        }
+        if conflicts
+            .iter()
+            .any(|a| seen_args.iter().any(|id| id == a.get_id()))
+        {
+            conflicting.insert(arg.get_id().clone());
+        }
+    }
+    if conflicting.is_empty() {
+        return completions;
+    }
+
+    completions
+        .into_iter()
+        .filter(|candidate| {
+            candidate
+                .get_id()
+                .and_then(|id| id.strip_prefix("arg::"))
+                .map(|arg_id| !conflicting.contains(arg_id))
+                .unwrap_or(true)
+        })
+        .collect()
+}
+
 fn complete_option(
     arg: &clap_lex::ParsedArg<'_>,
     cmd: &clap::Command,
@@ -309,7 +367,7 @@ fn complete_option(
     } else if let Some(short) = arg.to_short() {
         if !short.is_negative_number() {
             // Find the first takes_values option.
-            let (leading_flags, takes_value_opt, mut short) = parse_shortflags(cmd, short);
+            let (leading_flags, _, takes_value_opt, mut short) = parse_shortflags(cmd, short);
 
             // Clone `short` to `peek_short` to peek whether the next flag is a `=`.
             if let Some(opt) = takes_value_opt {
@@ -616,12 +674,21 @@ fn populate_command_candidate(
 }
 
 /// Parse the short flags and find the first `takes_values` option.
+///
+/// Returns the leading flags, every matched flag argument, the first
+/// `takes_values` option (if any), and the remaining unparsed short flags.
 fn parse_shortflags<'c, 's>(
     cmd: &'c clap::Command,
     mut short: clap_lex::ShortFlags<'s>,
-) -> (String, Option<&'c clap::Arg>, clap_lex::ShortFlags<'s>) {
+) -> (
+    String,
+    Vec<&'c clap::Arg>,
+    Option<&'c clap::Arg>,
+    clap_lex::ShortFlags<'s>,
+) {
     let takes_value_opt;
     let mut leading_flags = String::new();
+    let mut matched_flags = Vec::new();
     // Find the first takes_values option.
     loop {
         match short.next_flag() {
@@ -636,6 +703,9 @@ fn parse_shortflags<'c, 's>(
                     });
                     is_find.unwrap_or(false)
                 });
+                if let Some(opt) = opt {
+                    matched_flags.push(opt);
+                }
                 if opt
                     .map(|o| o.get_num_args().expect("built").takes_values())
                     .unwrap_or(false)
@@ -651,7 +721,7 @@ fn parse_shortflags<'c, 's>(
         }
     }
 
-    (leading_flags, takes_value_opt, short)
+    (leading_flags, matched_flags, takes_value_opt, short)
 }
 
 /// Parse the positional arguments. Return the new state and the new positional index.

@@ -194,6 +194,126 @@ fn suggest_long_flag_subset() {
     );
 }
 
+fn conflicting_tool_cmd() -> Command {
+    Command::new("tool")
+        .disable_help_flag(true)
+        .disable_version_flag(true)
+        .arg(
+            clap::Arg::new("json")
+                .long("json")
+                .visible_alias("j")
+                .alias("legacy-json")
+                .action(clap::ArgAction::Count)
+                .conflicts_with("toml"),
+        )
+        .arg(
+            clap::Arg::new("toml")
+                .long("toml")
+                .action(clap::ArgAction::Count),
+        )
+        .arg(
+            clap::Arg::new("verbose")
+                .long("verbose")
+                .action(clap::ArgAction::Count)
+                .conflicts_with("quiet"),
+        )
+        .arg(
+            clap::Arg::new("quiet")
+                .long("quiet")
+                .action(clap::ArgAction::Count),
+        )
+}
+
+#[test]
+fn suggest_long_flags_excluding_conflicts() {
+    let mut cmd = conflicting_tool_cmd();
+
+    assert_data_eq!(
+        complete!(cmd, "--json "),
+        snapbox::str![[r#"
+--json
+--verbose
+--quiet
+"#]],
+    );
+
+    // `--toml` is the only candidate with a `--t` prefix and it conflicts with
+    // the already present `--json`, so no candidates remain.
+    assert_data_eq!(complete!(cmd, "--json --t"), snapbox::str![[]]);
+}
+
+#[test]
+fn suggest_long_flags_excluding_conflicts_repeated_flag() {
+    let mut cmd = conflicting_tool_cmd();
+
+    assert_data_eq!(
+        complete!(cmd, "--json --json "),
+        snapbox::str![[r#"
+--json
+--verbose
+--quiet
+"#]],
+    );
+}
+
+#[test]
+fn suggest_long_flags_excluding_conflicts_reverse() {
+    let mut cmd = conflicting_tool_cmd();
+
+    // `toml` does not declare the conflict itself, `json` does; the conflict
+    // still applies in both directions.
+    assert_data_eq!(
+        complete!(cmd, "--toml "),
+        snapbox::str![[r#"
+--toml
+--verbose
+--quiet
+"#]],
+    );
+}
+
+#[test]
+fn suggest_long_flags_with_conflicting_prior_args() {
+    let mut cmd = conflicting_tool_cmd();
+
+    // The command line already contains a conflicting pair; completion must
+    // not fail and still offers the remaining non-conflicting candidates.
+    assert_data_eq!(
+        complete!(cmd, "--verbose --quiet "),
+        snapbox::str![[r#"
+--json
+--toml
+"#]],
+    );
+}
+
+#[test]
+fn suggest_long_flags_excluding_conflicts_visible_alias() {
+    let mut cmd = conflicting_tool_cmd();
+
+    assert_data_eq!(
+        complete!(cmd, "--j "),
+        snapbox::str![[r#"
+--json
+--verbose
+--quiet
+"#]],
+    );
+}
+
+#[test]
+fn suggest_long_flags_excluding_conflicts_hidden_alias() {
+    let mut cmd = conflicting_tool_cmd();
+
+    assert_data_eq!(
+        complete!(cmd, "--legacy-json --toml "),
+        snapbox::str![[r#"
+--verbose
+--quiet
+"#]],
+    );
+}
+
 #[test]
 fn suggest_possible_value_subset() {
     let name = "exhaustive";
