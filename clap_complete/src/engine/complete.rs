@@ -61,12 +61,14 @@ pub fn complete(
             );
         }
 
-        if let Ok(value) = arg.to_value() {
-            if let Some(next_cmd) = current_cmd.find_subcommand(value) {
-                current_cmd = next_cmd;
-                pos_index = 1;
-                used_args.clear();
-                continue;
+        if !is_escaped {
+            if let Ok(value) = arg.to_value() {
+                if let Some(next_cmd) = current_cmd.find_subcommand(value) {
+                    current_cmd = next_cmd;
+                    pos_index = 1;
+                    used_args.clear();
+                    continue;
+                }
             }
         }
 
@@ -153,8 +155,10 @@ fn complete_arg(
 
     match state {
         ParseState::ValueDone => {
-            if let Ok(value) = arg.to_value() {
-                completions.extend(complete_subcommand(value, cmd));
+            if !is_escaped {
+                if let Ok(value) = arg.to_value() {
+                    completions.extend(complete_subcommand(value, cmd));
+                }
             }
 
             if let Some(positional) = cmd

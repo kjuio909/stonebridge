@@ -1595,6 +1595,93 @@ fn hidden_alias_shares_conflicts() {
     assert_eq!(completions, ["--verbose", "--quiet"]);
 }
 
+fn escape_cmd() -> Command {
+    Command::new("tool")
+        .disable_help_flag(true)
+        .disable_version_flag(true)
+        .arg(
+            clap::Arg::new("config")
+                .long("config")
+                .value_parser(["dev", "prod"]),
+        )
+        .arg(clap::Arg::new("root-pos").value_parser(["alpha", "beta"]))
+        .subcommand(
+            Command::new("run")
+                .arg(
+                    clap::Arg::new("format")
+                        .long("format")
+                        .value_parser(["text", "json"]),
+                )
+                .arg(clap::Arg::new("run-pos").value_parser(["one", "two"])),
+        )
+}
+
+fn complete_escape(args: &[&str]) -> Vec<String> {
+    let mut cmd = escape_cmd();
+    let args: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
+    let arg_index = args.len() - 1;
+    clap_complete::engine::complete(&mut cmd, args, arg_index, None)
+        .unwrap()
+        .into_iter()
+        .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+        .collect()
+}
+
+#[test]
+fn escape_terminator_limits_root_to_positionals() {
+    // After `--`, only positional values are offered: no options, no subcommands.
+    assert_eq!(complete_escape(&["tool", "--", ""]), ["alpha", "beta"]);
+    assert_eq!(complete_escape(&["tool", "--", "a"]), ["alpha"]);
+}
+
+#[test]
+fn escape_terminator_limits_subcommand_to_positionals() {
+    assert_eq!(complete_escape(&["tool", "run", "--", ""]), ["one", "two"]);
+    // Text after `--` is never re-interpreted as an option; this is a
+    // successful empty completion, not an error.
+    assert!(complete_escape(&["tool", "run", "--", "--f"]).is_empty());
+}
+
+#[test]
+fn escape_terminator_does_not_change_prior_behavior() {
+    // Before `--`, options, subcommands, and value completion work as usual.
+    assert_eq!(
+        complete_escape(&["tool", ""]),
+        ["run", "help", "alpha", "beta", "--config"]
+    );
+    assert_eq!(complete_escape(&["tool", "--c"]), ["--config"]);
+    assert_eq!(complete_escape(&["tool", "--config", "d"]), ["dev"]);
+    assert_eq!(complete_escape(&["tool", "run", "--f"]), ["--format"]);
+    assert_eq!(complete_escape(&["tool", "run", "--format", "j"]), ["json"]);
+}
+
+#[test]
+fn escape_terminator_ignores_prior_args() {
+    // Valid or invalid options before `--` do not affect what comes after.
+    assert_eq!(
+        complete_escape(&["tool", "--config", "dev", "--", ""]),
+        ["alpha", "beta"]
+    );
+    assert_eq!(
+        complete_escape(&["tool", "--unknown", "--", ""]),
+        ["alpha", "beta"]
+    );
+    assert_eq!(
+        complete_escape(&["tool", "run", "--unknown", "--", ""]),
+        ["one", "two"]
+    );
+    // A subcommand name after `--` is a positional value, not a descent
+    // into that subcommand.
+    assert!(complete_escape(&["tool", "--", "run", ""]).is_empty());
+}
+
+#[test]
+fn escape_terminator_positional_overflow_is_empty() {
+    // More words than declared positionals: successful empty completion.
+    assert!(complete_escape(&["tool", "--", "alpha", "beta", ""]).is_empty());
+    assert!(complete_escape(&["tool", "run", "--", "one", "two", ""]).is_empty());
+}
+
 #[test]
 fn sort_and_filter() {
     let mut cmd = Command::new("exhaustive")
