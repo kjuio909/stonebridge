@@ -1476,6 +1476,125 @@ pos3
     assert_data_eq!(complete!(cmd, "e[TAB]"), snapbox::str!["external"]);
 }
 
+fn tool_cmd() -> Command {
+    Command::new("tool")
+        .disable_help_flag(true)
+        .disable_version_flag(true)
+        .args_override_self(true)
+        .arg(
+            clap::Arg::new("json")
+                .long("json")
+                .visible_alias("j")
+                .alias("legacy-json")
+                .action(clap::ArgAction::SetTrue)
+                .conflicts_with("toml"),
+        )
+        .arg(
+            clap::Arg::new("toml")
+                .long("toml")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            clap::Arg::new("verbose")
+                .long("verbose")
+                .action(clap::ArgAction::SetTrue)
+                .conflicts_with("quiet"),
+        )
+        .arg(
+            clap::Arg::new("quiet")
+                .long("quiet")
+                .action(clap::ArgAction::SetTrue),
+        )
+}
+
+fn complete_tool(args: &[&str]) -> Vec<String> {
+    let mut cmd = tool_cmd();
+    let args: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
+    let arg_index = args.len() - 1;
+    clap_complete::engine::complete(&mut cmd, args, arg_index, None)
+        .unwrap()
+        .into_iter()
+        .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+        .collect()
+}
+
+#[test]
+fn conflicting_long_options_are_filtered() {
+    // Baseline: no conflicts in play, grouping and order are untouched.
+    assert_eq!(
+        complete_tool(&["tool", ""]),
+        ["--json", "--toml", "--verbose", "--quiet"]
+    );
+
+    // `--json` conflicts with `--toml`; unrelated candidates remain.
+    let completions = complete_tool(&["tool", "--json", ""]);
+    assert!(completions.contains(&"--verbose".to_owned()));
+    assert!(completions.contains(&"--quiet".to_owned()));
+    assert!(!completions.contains(&"--toml".to_owned()));
+    assert_eq!(completions, ["--json", "--verbose", "--quiet"]);
+}
+
+#[test]
+fn conflict_filter_respects_prefix() {
+    // `--t` only prefixes `--toml`, which conflicts with `--json`;
+    // the result is a successful empty completion, not an unrelated candidate.
+    let completions = complete_tool(&["tool", "--json", "--t"]);
+    assert!(!completions.contains(&"--toml".to_owned()));
+    assert!(!completions.contains(&"--quiet".to_owned()));
+    assert!(completions.is_empty());
+}
+
+#[test]
+fn conflict_filter_with_repeated_flag() {
+    // Repeating the same flag does not change the filtered result.
+    let completions = complete_tool(&["tool", "--json", "--json", ""]);
+    assert!(completions.contains(&"--verbose".to_owned()));
+    assert!(completions.contains(&"--quiet".to_owned()));
+    assert!(!completions.contains(&"--toml".to_owned()));
+    assert_eq!(completions, ["--json", "--verbose", "--quiet"]);
+}
+
+#[test]
+fn conflict_is_bidirectional() {
+    // The conflict is only declared on `json`, but `--toml` on the
+    // command line must also exclude `--json`.
+    let completions = complete_tool(&["tool", "--toml", ""]);
+    assert!(completions.contains(&"--verbose".to_owned()));
+    assert!(completions.contains(&"--quiet".to_owned()));
+    assert!(!completions.contains(&"--json".to_owned()));
+    assert_eq!(completions, ["--toml", "--verbose", "--quiet"]);
+}
+
+#[test]
+fn conflicting_prior_args_do_not_fail_completion() {
+    // The command line already contains a conflicting pair; completion
+    // must still succeed and offer the remaining non-conflicting candidates.
+    let completions = complete_tool(&["tool", "--verbose", "--quiet", ""]);
+    assert!(completions.contains(&"--json".to_owned()));
+    assert!(completions.contains(&"--toml".to_owned()));
+    assert_eq!(completions, ["--json", "--toml"]);
+}
+
+#[test]
+fn visible_alias_shares_conflicts() {
+    // `--j` is a visible alias of `json`, so `toml` is excluded.
+    let completions = complete_tool(&["tool", "--j", ""]);
+    assert!(completions.contains(&"--verbose".to_owned()));
+    assert!(completions.contains(&"--quiet".to_owned()));
+    assert!(!completions.contains(&"--toml".to_owned()));
+}
+
+#[test]
+fn hidden_alias_shares_conflicts() {
+    // `--legacy-json` is a hidden alias of `json`; combined with `--toml`
+    // on the command line, `json` must be excluded from the candidates.
+    let completions = complete_tool(&["tool", "--legacy-json", "--toml", ""]);
+    assert!(completions.contains(&"--verbose".to_owned()));
+    assert!(completions.contains(&"--quiet".to_owned()));
+    assert!(!completions.contains(&"--json".to_owned()));
+    assert_eq!(completions, ["--verbose", "--quiet"]);
+}
+
 #[test]
 fn sort_and_filter() {
     let mut cmd = Command::new("exhaustive")
