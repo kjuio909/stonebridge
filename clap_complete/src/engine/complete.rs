@@ -61,12 +61,15 @@ pub fn complete(
             );
         }
 
-        if let Ok(value) = arg.to_value() {
-            if let Some(next_cmd) = current_cmd.find_subcommand(value) {
-                current_cmd = next_cmd;
-                pos_index = 1;
-                used_args.clear();
-                continue;
+        // Tokens after `--` are positional values, never subcommands.
+        if !is_escaped {
+            if let Ok(value) = arg.to_value() {
+                if let Some(next_cmd) = current_cmd.find_subcommand(value) {
+                    current_cmd = next_cmd;
+                    pos_index = 1;
+                    used_args.clear();
+                    continue;
+                }
             }
         }
 
@@ -74,7 +77,27 @@ pub fn complete(
             (next_state, pos_index) =
                 parse_positional(current_cmd, pos_index, is_escaped, current_state);
         } else if arg.is_escape() {
-            is_escaped = true;
+            // A pending arg with `allow_hyphen_values` consumes `--` as a
+            // value, like in the parser; otherwise parsing is escaped.
+            let escape_is_value = match current_state {
+                ParseState::Opt((opt, _)) => opt.is_allow_hyphen_values_set(),
+                ParseState::Pos((state_pos_index, _)) => {
+                    pos_allows_hyphen(current_cmd, state_pos_index)
+                }
+                ParseState::ValueDone => false,
+            };
+            if escape_is_value {
+                match current_state {
+                    ParseState::Opt((opt, count)) => next_state = parse_opt_value(opt, count),
+                    ParseState::Pos(..) => {
+                        (next_state, pos_index) =
+                            parse_positional(current_cmd, pos_index, is_escaped, current_state);
+                    }
+                    ParseState::ValueDone => unreachable!(),
+                }
+            } else {
+                is_escaped = true;
+            }
         } else if opt_allows_hyphen(&current_state, &arg) {
             match current_state {
                 ParseState::Opt((opt, count)) => next_state = parse_opt_value(opt, count),
@@ -153,8 +176,12 @@ fn complete_arg(
 
     match state {
         ParseState::ValueDone => {
-            if let Ok(value) = arg.to_value() {
-                completions.extend(complete_subcommand(value, cmd));
+            // After a `--` terminator every remaining token is a positional
+            // value: subcommands and options are no longer recognized.
+            if !is_escaped {
+                if let Ok(value) = arg.to_value() {
+                    completions.extend(complete_subcommand(value, cmd));
+                }
             }
 
             if let Some(positional) = cmd
