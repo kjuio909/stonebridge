@@ -1595,6 +1595,168 @@ fn hidden_alias_shares_conflicts() {
     assert_eq!(completions, ["--verbose", "--quiet"]);
 }
 
+/// Build the `tool` command used by the global-option conflict tests:
+/// - `--profile`/`-p` (global, values `prod`/`dev`) conflicts with `--offline`/`-o`
+/// - `--token`/`-t` (global) conflicts with `--verbose`/`-v` (global)
+/// - `remote fetch` defines `--plain`/`-P` (conflicts with `offline`) and
+///   `--stream`/`-s` (conflicts with `profile`)
+fn global_tool_cmd() -> Command {
+    Command::new("tool")
+        .disable_help_flag(true)
+        .disable_version_flag(true)
+        .arg(
+            clap::Arg::new("profile")
+                .long("profile")
+                .short('p')
+                .global(true)
+                .value_parser(["prod", "dev"])
+                .conflicts_with("offline"),
+        )
+        .arg(
+            clap::Arg::new("offline")
+                .long("offline")
+                .short('o')
+                .global(true)
+                .action(clap::ArgAction::SetTrue)
+                .conflicts_with("profile"),
+        )
+        .arg(
+            clap::Arg::new("token")
+                .long("token")
+                .short('t')
+                .global(true)
+                .conflicts_with("verbose"),
+        )
+        .arg(
+            clap::Arg::new("verbose")
+                .long("verbose")
+                .short('v')
+                .global(true)
+                .action(clap::ArgAction::SetTrue)
+                .conflicts_with("token"),
+        )
+        .subcommand(
+            Command::new("remote").subcommand(
+                Command::new("fetch")
+                    .arg(
+                        clap::Arg::new("plain")
+                            .long("plain")
+                            .short('P')
+                            .action(clap::ArgAction::SetTrue)
+                            .conflicts_with("offline"),
+                    )
+                    .arg(
+                        clap::Arg::new("stream")
+                            .long("stream")
+                            .short('s')
+                            .action(clap::ArgAction::SetTrue)
+                            .conflicts_with("profile"),
+                    ),
+            ),
+        )
+}
+
+fn complete_global_tool(args: &[&str]) -> Vec<String> {
+    let mut cmd = global_tool_cmd();
+    let args: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
+    let arg_index = args.len() - 1;
+    clap_complete::engine::complete(&mut cmd, args, arg_index, None)
+        .unwrap()
+        .into_iter()
+        .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+        .collect()
+}
+
+#[test]
+fn global_conflicts_filter_in_subcommand() {
+    // Baseline: every option (globals and fetch-local) is offered.
+    assert_eq!(
+        complete_global_tool(&["tool", "remote", "fetch", ""]),
+        [
+            "--plain",
+            "--profile",
+            "--stream",
+            "--offline",
+            "--token",
+            "--verbose"
+        ]
+    );
+
+    // `--profile prod` is global, so inside `remote fetch` it excludes
+    // `--offline` (mutual conflict) and `--stream` (conflicts with profile),
+    // while keeping `--plain`, `--token` and the other unrelated candidates.
+    assert_eq!(
+        complete_global_tool(&["tool", "-p", "prod", "remote", "fetch", ""]),
+        ["--plain", "--profile", "--token", "--verbose"]
+    );
+}
+
+#[test]
+fn global_conflict_short_equals_matches_space_form() {
+    // `-p=prod` must be parsed exactly like the spaced `-p prod` form,
+    // producing identical candidates.
+    assert_eq!(
+        complete_global_tool(&["tool", "-p=prod", "remote", "fetch", ""]),
+        complete_global_tool(&["tool", "-p", "prod", "remote", "fetch", ""])
+    );
+    assert_eq!(
+        complete_global_tool(&["tool", "-p=prod", "remote", "fetch", ""]),
+        ["--plain", "--profile", "--token", "--verbose"]
+    );
+}
+
+#[test]
+fn global_option_value_position_completes_only_values() {
+    // At the value position only matching values are offered, never options
+    // or positionals, regardless of spacing or equals form.
+    assert_eq!(complete_global_tool(&["tool", "-p", "pr"]), ["prod"]);
+    assert_eq!(complete_global_tool(&["tool", "-p=pr"]), ["-p=prod"]);
+
+    // A value prefix with no match is a successful, empty completion.
+    assert!(complete_global_tool(&["tool", "-p", "xx"]).is_empty());
+    assert!(complete_global_tool(&["tool", "-p=xx"]).is_empty());
+}
+
+#[test]
+fn clustered_short_flags_are_split_for_conflicts() {
+    // `-vP` must be decomposed into the global `verbose` and the fetch-local
+    // `plain`: `token` (conflicts with verbose) and `offline` (conflicts with
+    // plain) are excluded while unaffected candidates like `stream` remain.
+    assert_eq!(
+        complete_global_tool(&["tool", "remote", "fetch", "-vP", ""]),
+        ["--plain", "--profile", "--stream", "--verbose"]
+    );
+}
+
+#[test]
+fn conflicting_prior_args_keep_unrelated_candidates() {
+    // The command line already contains `profile` and `stream`, which
+    // conflict. Completion must still succeed and only drop the candidates
+    // excluded by an already-present argument (`stream` and `offline` via
+    // `profile`, `profile` via `stream`), leaving unrelated results intact.
+    assert_eq!(
+        complete_global_tool(&["tool", "-p", "prod", "remote", "fetch", "-s", ""]),
+        ["--plain", "--token", "--verbose"]
+    );
+}
+
+#[test]
+fn global_candidates_are_not_duplicated() {
+    // Long/short names, spaced and equals values must never yield duplicates.
+    for args in [
+        &["tool", "remote", "fetch", ""][..],
+        &["tool", "remote", "fetch", "-P", ""][..],
+        &["tool", "-o", "remote", "fetch", ""][..],
+    ] {
+        let candidates = complete_global_tool(args);
+        let mut unique = candidates.clone();
+        unique.sort();
+        let count = unique.len();
+        unique.dedup();
+        assert_eq!(count, unique.len(), "duplicate candidates for {args:?}: {candidates:?}");
+    }
+}
+
 #[test]
 fn sort_and_filter() {
     let mut cmd = Command::new("exhaustive")
