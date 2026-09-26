@@ -2539,6 +2539,258 @@ fn optional_value_preserves_candidate_metadata() {
     assert_eq!(escaped, expected);
 }
 
+fn nested_color_tool_cmd() -> Command {
+    Command::new("tool")
+        .disable_help_flag(true)
+        .disable_version_flag(true)
+        .disable_help_subcommand(true)
+        .arg(
+            clap::Arg::new("color")
+                .long("color")
+                .num_args(0..=1)
+                .value_parser(["auto", "always", "never"]),
+        )
+        .arg(
+            clap::Arg::new("quiet")
+                .long("quiet")
+                .action(clap::ArgAction::SetTrue)
+                .conflicts_with("color"),
+        )
+        .arg(clap::Arg::new("root-pos").value_parser(["src", "dst"]))
+        .subcommand(
+            Command::new("run")
+                .disable_help_flag(true)
+                .disable_version_flag(true)
+                .arg(
+                    clap::Arg::new("color")
+                        .long("color")
+                        .num_args(0..=1)
+                        .value_parser(["auto", "always", "never"]),
+                )
+                .arg(clap::Arg::new("run-pos").value_parser(["job", "log"])),
+        )
+}
+
+fn complete_nested_color_tool(args: &[&str]) -> Vec<CompletionCandidate> {
+    let mut cmd = nested_color_tool_cmd();
+    let args: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
+    let arg_index = args.len() - 1;
+    clap_complete::engine::complete(&mut cmd, args, arg_index, None).unwrap()
+}
+
+fn nested_color_tool_values(args: &[&str]) -> Vec<String> {
+    complete_nested_color_tool(args)
+        .into_iter()
+        .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+        .collect()
+}
+
+#[test]
+fn root_color_does_not_leak_into_run_pending_color() {
+    // A completed root `--color` before `run` must not leak root positionals
+    // or the conflicting `--quiet` into the run-level pending `--color`.
+    assert_eq!(
+        nested_color_tool_values(&["tool", "--color", "auto", "run", "--color", ""]),
+        ["auto", "always", "never"]
+    );
+    assert_eq!(
+        nested_color_tool_values(&["tool", "--color=auto", "run", "--color", ""]),
+        ["auto", "always", "never"]
+    );
+    assert_eq!(
+        nested_color_tool_values(&["tool", "--color", "auto", "run", "--color", "a"]),
+        ["auto", "always"]
+    );
+    assert_eq!(
+        nested_color_tool_values(&["tool", "--color", "auto", "run", "--color="]),
+        ["--color=auto", "--color=always", "--color=never"]
+    );
+
+    // Root options must not leak into the run level either: only the
+    // run-level `--color` matches, never the root-level `--quiet`.
+    assert_eq!(
+        nested_color_tool_values(&["tool", "--color", "auto", "run", "--"]),
+        ["--color"]
+    );
+    assert_eq!(
+        nested_color_tool_values(&["tool", "--color", "auto", "run", ""]),
+        ["job", "log", "--color"]
+    );
+}
+
+#[test]
+fn run_level_color_can_repeat_after_value() {
+    // After a complete run-level color, another `--color` can still take a
+    // value, whether the earlier value was space- or equals-separated.
+    assert_eq!(
+        nested_color_tool_values(&["tool", "run", "--color", "auto", "--color", ""]),
+        ["auto", "always", "never"]
+    );
+    assert_eq!(
+        nested_color_tool_values(&["tool", "run", "--color=auto", "--color", ""]),
+        ["auto", "always", "never"]
+    );
+    assert_eq!(
+        nested_color_tool_values(&["tool", "run", "--color", "auto", "--color="]),
+        ["--color=auto", "--color=always", "--color=never"]
+    );
+
+    // A root-level color followed by two run-level colors: each level tracks
+    // its own occurrences.
+    assert_eq!(
+        nested_color_tool_values(&[
+            "tool", "--color", "never", "run", "--color", "auto", "--color", ""
+        ]),
+        ["auto", "always", "never"]
+    );
+}
+
+#[test]
+fn pending_color_ends_at_flag_like_word_per_level() {
+    // `--quiet` ends the pending value; `--color` stands alone and still
+    // counts as present, so the conflicting `--quiet` is filtered out.
+    assert!(nested_color_tool_values(&["tool", "--color", "--q"]).is_empty());
+    // Once `--quiet` is on the line the conflicting pair excludes both
+    // options; the remaining root candidates are still offered.
+    assert_eq!(
+        nested_color_tool_values(&["tool", "--color", "--quiet", ""]),
+        ["run", "src", "dst"]
+    );
+
+    // An unknown long prefix ends the pending value with a successful empty
+    // result, and completion afterwards reflects only the current level.
+    assert!(nested_color_tool_values(&["tool", "--color", "--bogus"]).is_empty());
+    assert_eq!(
+        nested_color_tool_values(&["tool", "--color", "--bogus", ""]),
+        ["run", "src", "dst", "--color"]
+    );
+
+    // Same at the run level: only run-level candidates, no parent state.
+    assert_eq!(
+        nested_color_tool_values(&["tool", "run", "--color", "--c"]),
+        ["--color"]
+    );
+    assert_eq!(
+        nested_color_tool_values(&["tool", "--color", "auto", "run", "--color", "--c"]),
+        ["--color"]
+    );
+    // The root-level `--quiet` does not exist at the run level.
+    assert!(nested_color_tool_values(&["tool", "run", "--color", "--q"]).is_empty());
+    assert_eq!(
+        nested_color_tool_values(&["tool", "run", "--color", "--bogus", ""]),
+        ["job", "log", "--color"]
+    );
+}
+
+#[test]
+fn terminator_after_pending_color_completes_own_level_positionals() {
+    // `--` cancels the pending optional value; only the current level's
+    // positionals are offered from then on.
+    assert_eq!(
+        nested_color_tool_values(&["tool", "--color", "--", ""]),
+        ["src", "dst"]
+    );
+    assert_eq!(
+        nested_color_tool_values(&["tool", "run", "--color", "--", ""]),
+        ["job", "log"]
+    );
+
+    // A root-level color before `run` does not change which level the
+    // terminator belongs to.
+    assert_eq!(
+        nested_color_tool_values(&["tool", "--color", "auto", "run", "--color", "--", ""]),
+        ["job", "log"]
+    );
+
+    // The run level must not fall back to root positionals.
+    assert!(nested_color_tool_values(&["tool", "run", "--color", "--", "src"]).is_empty());
+    assert_eq!(
+        nested_color_tool_values(&["tool", "run", "--color", "--", "j"]),
+        ["job"]
+    );
+    assert_eq!(
+        nested_color_tool_values(&["tool", "--color", "--", "s"]),
+        ["src"]
+    );
+}
+
+#[test]
+fn after_terminator_words_stay_positional_per_level() {
+    // Subcommand names, option-style words, and unknown words after `--` are
+    // positional values that match nothing: successful empty results, with no
+    // level switching and no fallback to the parent level.
+    for word in ["run", "--color", "--quiet", "-x", "bogus"] {
+        assert!(
+            nested_color_tool_values(&["tool", "--color", "--", word]).is_empty(),
+            "unexpected candidates for {word:?}"
+        );
+        assert!(
+            nested_color_tool_values(&["tool", "run", "--color", "--", word]).is_empty(),
+            "unexpected candidates for {word:?}"
+        );
+    }
+
+    // A consumed positional slot cannot be completed again and cannot
+    // re-enter option parsing or descend into `run`.
+    assert!(nested_color_tool_values(&["tool", "--color", "--", "src", ""]).is_empty());
+    assert!(nested_color_tool_values(&["tool", "run", "--color", "--", "job", ""]).is_empty());
+}
+
+#[test]
+fn nested_color_preserves_candidate_metadata() {
+    // Value, help, id, tag, display order, and hidden state of the retained
+    // candidates must be identical regardless of how earlier words were
+    // written or which level they were on.
+    let spaced = candidate_metadata(complete_nested_color_tool(&[
+        "tool", "--color", "auto", "run", "--color", "",
+    ]));
+    let attached = candidate_metadata(complete_nested_color_tool(&[
+        "tool", "--color=auto", "run", "--color", "",
+    ]));
+    assert_eq!(spaced, attached);
+
+    // The nested `run` level defines the same `--color`; its candidates carry
+    // the same metadata as the root level's.
+    let root = candidate_metadata(complete_nested_color_tool(&["tool", "--color", ""]));
+    let nested = candidate_metadata(complete_nested_color_tool(&["tool", "run", "--color", ""]));
+    assert_eq!(root, nested);
+
+    // The equals form only adds the `--color=` prefix to each value; every
+    // other piece of metadata is untouched.
+    let equals = candidate_metadata(complete_nested_color_tool(&["tool", "run", "--color="]));
+    assert_eq!(nested.len(), equals.len());
+    for (spaced, equals) in nested.iter().zip(equals.iter()) {
+        assert_eq!(format!("--color={}", spaced.0), equals.0);
+        assert_eq!(spaced.1, equals.1);
+        assert_eq!(spaced.2, equals.2);
+        assert_eq!(spaced.3, equals.3);
+        assert_eq!(spaced.4, equals.4);
+        assert_eq!(spaced.5, equals.5);
+    }
+
+    // Cancelling the pending value with `--` may only shrink the candidate
+    // set; the retained positionals are byte-for-byte identical.
+    let plain = candidate_metadata(complete_nested_color_tool(&["tool", ""]));
+    let escaped = candidate_metadata(complete_nested_color_tool(&["tool", "--color", "--", ""]));
+    let expected: Vec<_> = plain
+        .iter()
+        .filter(|candidate| candidate.0 == "src" || candidate.0 == "dst")
+        .cloned()
+        .collect();
+    assert_eq!(escaped, expected);
+
+    let plain = candidate_metadata(complete_nested_color_tool(&["tool", "run", ""]));
+    let escaped = candidate_metadata(complete_nested_color_tool(&[
+        "tool", "run", "--color", "--", "",
+    ]));
+    let expected: Vec<_> = plain
+        .iter()
+        .filter(|candidate| candidate.0 == "job" || candidate.0 == "log")
+        .cloned()
+        .collect();
+    assert_eq!(escaped, expected);
+}
+
 fn complete(cmd: &mut Command, args: impl AsRef<str>, current_dir: Option<&Path>) -> String {
     let input = args.as_ref();
     let mut args = vec![std::ffi::OsString::from(cmd.get_name())];
