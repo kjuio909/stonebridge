@@ -1742,6 +1742,55 @@ fn terminator_preserves_candidate_metadata() {
 }
 
 #[test]
+fn terminator_at_root_completes_only_root_positionals() {
+    // After `--` at the root level, only root positionals are offered;
+    // no options and no subcommands.
+    assert_eq!(terminator_tool_values(&["tool", "--", ""]), ["alpha", "beta"]);
+}
+
+#[test]
+fn terminator_in_subcommand_completes_only_its_positionals() {
+    // After `--` inside `run`, only `run`'s positionals are offered; the
+    // parse must not fall back to the root command's options or positionals.
+    assert_eq!(
+        terminator_tool_values(&["tool", "run", "--", ""]),
+        ["one", "two"]
+    );
+    // `al` would match the root positional `alpha`; falling back to the root
+    // command is not allowed.
+    assert!(terminator_tool_values(&["tool", "run", "--", "al"]).is_empty());
+}
+
+#[test]
+fn subcommand_name_after_terminator_does_not_descend() {
+    // `run` after `--` is positional text, not a subcommand: it neither
+    // completes as a subcommand name nor re-descends into `run`'s parser.
+    assert!(terminator_tool_values(&["tool", "--", "run"]).is_empty());
+    assert!(terminator_tool_values(&["tool", "--", "run", ""]).is_empty());
+    // Same inside the subcommand layer: `run` is not re-matched there either.
+    assert!(terminator_tool_values(&["tool", "--config", "--", "run"]).is_empty());
+    assert!(terminator_tool_values(&["tool", "run", "--format", "--", "run"]).is_empty());
+}
+
+#[test]
+fn prefix_after_terminator_filters_positionals() {
+    assert_eq!(terminator_tool_values(&["tool", "--", "a"]), ["alpha"]);
+    assert_eq!(terminator_tool_values(&["tool", "run", "--", "t"]), ["two"]);
+}
+
+#[test]
+fn option_like_words_after_terminator_are_empty() {
+    // Option-style text after `--` is positional text; no option of the
+    // current or parent command may leak into the candidates.
+    assert!(terminator_tool_values(&["tool", "--", "--c"]).is_empty());
+    assert!(terminator_tool_values(&["tool", "run", "--", "--c"]).is_empty());
+    assert!(terminator_tool_values(&["tool", "run", "--", "--f"]).is_empty());
+    // A consumed option-like word stays positional; completion after it
+    // succeeds with no candidates rather than re-entering option parsing.
+    assert!(terminator_tool_values(&["tool", "run", "--", "--format", ""]).is_empty());
+}
+
+#[test]
 fn sort_and_filter() {
     let mut cmd = Command::new("exhaustive")
         .args([
