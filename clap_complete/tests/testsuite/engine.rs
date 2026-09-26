@@ -1749,6 +1749,34 @@ fn invalid_words_before_terminator_still_complete() {
 }
 
 #[test]
+fn conflicting_args_before_terminator_still_complete() {
+    // A conflicting pair already on the command line must not make completion
+    // after the terminator fail or drop the current level's positionals.
+    let mut cmd = terminator_tool_cmd()
+        .arg(
+            clap::Arg::new("alpha-flag")
+                .long("aa")
+                .conflicts_with("beta-flag"),
+        )
+        .arg(clap::Arg::new("beta-flag").long("bb"));
+    let mut complete = |args: &[&str]| {
+        let args: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
+        let arg_index = args.len() - 1;
+        clap_complete::engine::complete(&mut cmd, args, arg_index, None)
+            .unwrap()
+            .into_iter()
+            .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(complete(&["tool", "--aa", "--bb", "--", ""]), ["alpha", "beta"]);
+    assert_eq!(
+        complete(&["tool", "--aa", "--bb", "--config", "--", ""]),
+        ["alpha", "beta"]
+    );
+}
+
+#[test]
 fn out_of_range_positional_after_terminator_is_empty() {
     // Positional slots are exhausted; completion must succeed with no
     // candidates rather than erroring or falling back to the parent command.
