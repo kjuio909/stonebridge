@@ -1677,9 +1677,74 @@ fn flag_like_word_after_terminator_is_empty() {
 fn pre_terminator_behavior_is_unchanged() {
     assert_eq!(terminator_tool_values(&["tool", "--c"]), ["--config"]);
     assert_eq!(terminator_tool_values(&["tool", "--config", "d"]), ["dev"]);
+    assert_eq!(terminator_tool_values(&["tool", "run", "--f"]), ["--format"]);
     assert_eq!(
         terminator_tool_values(&["tool", "run", "--format", "j"]),
         ["json"]
+    );
+}
+
+#[test]
+fn root_terminator_completes_only_root_positionals() {
+    // No options, no subcommands, only the root positional values.
+    assert_eq!(terminator_tool_values(&["tool", "--", ""]), ["alpha", "beta"]);
+}
+
+#[test]
+fn nested_terminator_completes_only_nested_positionals() {
+    // The terminator inside `run` stays at the `run` level: its positionals
+    // are offered, not the root positionals or root options.
+    assert_eq!(terminator_tool_values(&["tool", "run", "--", ""]), ["one", "two"]);
+}
+
+#[test]
+fn subcommand_name_after_terminator_does_not_descend() {
+    // `run` after `--` is a positional value, not a subcommand: parsing must
+    // not descend into `run`, so no `run`-level candidates are offered.
+    assert!(terminator_tool_values(&["tool", "--", "run", ""]).is_empty());
+    // Completing the subcommand-named word itself offers nothing either.
+    assert!(terminator_tool_values(&["tool", "--", "run"]).is_empty());
+    assert!(terminator_tool_values(&["tool", "--", "r"]).is_empty());
+    assert!(terminator_tool_values(&["tool", "run", "--", "run"]).is_empty());
+}
+
+#[test]
+fn option_like_words_after_terminator_are_empty() {
+    // Option-style words after `--` are positional values; none match the
+    // possible values, so completion succeeds with no candidates instead of
+    // leaking options from the current or parent command.
+    for word in ["--f", "--config", "--format", "-x"] {
+        assert!(terminator_tool_values(&["tool", "--", word]).is_empty());
+        assert!(terminator_tool_values(&["tool", "run", "--", word]).is_empty());
+    }
+}
+
+#[test]
+fn prefix_after_terminator_filters_positionals() {
+    assert_eq!(terminator_tool_values(&["tool", "--", "a"]), ["alpha"]);
+    assert_eq!(terminator_tool_values(&["tool", "--", "b"]), ["beta"]);
+    assert_eq!(terminator_tool_values(&["tool", "--config", "--", "a"]), ["alpha"]);
+    // The pending `--config` value is cancelled by `--`; its values (`prod`)
+    // must not leak into the root positional completion.
+    assert!(terminator_tool_values(&["tool", "--config", "--", "p"]).is_empty());
+    assert_eq!(terminator_tool_values(&["tool", "run", "--", "t"]), ["two"]);
+    assert_eq!(
+        terminator_tool_values(&["tool", "run", "--format", "--", "o"]),
+        ["one"]
+    );
+}
+
+#[test]
+fn invalid_words_before_terminator_still_complete() {
+    // Unknown options before `--` must not break completion after the
+    // terminator; the current level's positionals are still offered.
+    assert_eq!(
+        terminator_tool_values(&["tool", "--bogus", "--", ""]),
+        ["alpha", "beta"]
+    );
+    assert_eq!(
+        terminator_tool_values(&["tool", "run", "--bogus", "--", ""]),
+        ["one", "two"]
     );
 }
 
@@ -1729,6 +1794,9 @@ fn terminator_preserves_candidate_metadata() {
         .collect();
     assert_eq!(escaped, expected);
 
+    let escaped = metadata(complete_terminator_tool(&["tool", "--", ""]));
+    assert_eq!(escaped, expected);
+
     let plain = metadata(complete_terminator_tool(&["tool", "run", ""]));
     let escaped = metadata(complete_terminator_tool(&[
         "tool", "run", "--format", "--", "",
@@ -1738,6 +1806,9 @@ fn terminator_preserves_candidate_metadata() {
         .filter(|candidate| candidate.0 == "one" || candidate.0 == "two")
         .cloned()
         .collect();
+    assert_eq!(escaped, expected);
+
+    let escaped = metadata(complete_terminator_tool(&["tool", "run", "--", ""]));
     assert_eq!(escaped, expected);
 }
 
