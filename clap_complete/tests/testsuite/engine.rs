@@ -2539,6 +2539,102 @@ fn optional_value_preserves_candidate_metadata() {
     assert_eq!(escaped, expected);
 }
 
+#[test]
+fn optional_value_root_state_does_not_leak_into_run() {
+    // A `--color` completed at the root before descending into `run` must not
+    // affect the `run` level: its pending `--color` offers only the three
+    // colors, never the root positionals or the root-only `--quiet`.
+    let colors = ["auto", "always", "never"];
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color", "auto", "run", "--color", ""]),
+        colors
+    );
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color=auto", "run", "--color", ""]),
+        colors
+    );
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--quiet", "run", "--color", ""]),
+        colors
+    );
+
+    // A flag-like word ends the pending value at the current level: the
+    // run-level `--color` is offered again, while the root-level `--quiet`
+    // must not leak into the `run` level.
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color", "auto", "run", "--color", "--c"]),
+        ["--color"]
+    );
+    assert!(optional_value_tool_values(&["tool", "--color", "auto", "run", "--color", "--q"]).is_empty());
+    // An unknown prefix is a successful empty result at the current level.
+    assert!(optional_value_tool_values(&["tool", "--color", "auto", "run", "--color", "x"]).is_empty());
+
+    // After the run-level `--color` takes a value, another `--color` can
+    // still take a value, in both the space and the equals form.
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color", "auto", "run", "--color", "always", "--color", ""]),
+        colors
+    );
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color", "auto", "run", "--color", "always", "--color="]),
+        ["--color=auto", "--color=always", "--color=never"]
+    );
+
+    // The terminator after the pending run-level `--color` offers only the
+    // run-level positionals; the root positionals must not leak in.
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color", "auto", "run", "--color", "--", ""]),
+        ["job", "log"]
+    );
+    assert!(
+        optional_value_tool_values(&["tool", "--color", "auto", "run", "--color", "--", "src"])
+            .is_empty()
+    );
+    // After the terminator, the subcommand name, option-style words, and
+    // unknown words are positional values matching nothing: successful empty
+    // results, with no return to option parsing or the parent level.
+    for word in ["run", "--color", "--quiet", "-x", "bogus"] {
+        assert!(
+            optional_value_tool_values(&["tool", "--color", "auto", "run", "--color", "--", word])
+                .is_empty(),
+            "unexpected candidates for {word:?}"
+        );
+    }
+}
+
+#[test]
+fn optional_value_metadata_consistent_across_levels_and_forms() {
+    // The run-level pending `--color`, reached after a root-level `--color`,
+    // must yield candidates byte-for-byte identical to the root-level pending
+    // `--color`, regardless of whether the root occurrence used the space or
+    // the equals form.
+    fn metadata(candidates: Vec<CompletionCandidate>) -> Vec<CandidateMetadata> {
+        candidates
+            .into_iter()
+            .map(|candidate| {
+                (
+                    candidate.get_value().to_string_lossy().into_owned(),
+                    candidate.get_help().map(|help| help.to_string()),
+                    candidate.get_id().cloned(),
+                    candidate.get_tag().map(|tag| tag.to_string()),
+                    candidate.get_display_order(),
+                    candidate.is_hide_set(),
+                )
+            })
+            .collect()
+    }
+
+    let root = metadata(complete_optional_value_tool(&["tool", "--color", ""]));
+    let nested_spaced = metadata(complete_optional_value_tool(&[
+        "tool", "--color", "auto", "run", "--color", "",
+    ]));
+    let nested_attached = metadata(complete_optional_value_tool(&[
+        "tool", "--color=auto", "run", "--color", "",
+    ]));
+    assert_eq!(root, nested_spaced);
+    assert_eq!(root, nested_attached);
+}
+
 fn complete(cmd: &mut Command, args: impl AsRef<str>, current_dir: Option<&Path>) -> String {
     let input = args.as_ref();
     let mut args = vec![std::ffi::OsString::from(cmd.get_name())];
