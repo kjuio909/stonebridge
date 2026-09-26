@@ -457,6 +457,14 @@ val3
 val1
 val2
 val3
+"#]]
+    );
+
+    // After one value the minimum is met, so a flag-like word switches to
+    // another option, while plain words keep completing option values.
+    assert_data_eq!(
+        complete!(cmd, "--uncertain-num val1 --[TAB]"),
+        snapbox::str![[r#"
 --certain-num
 --uncertain-num
 --help	Print help
@@ -514,6 +522,13 @@ val3
 val1
 val2
 val3
+"#]]
+    );
+
+    // A flag-like word after the minimum switches to another option.
+    assert_data_eq!(
+        complete!(cmd, "-N val1 --[TAB]"),
+        snapbox::str![[r#"
 --certain-num
 --uncertain-num
 --help	Print help
@@ -1893,6 +1908,302 @@ pos-c
 --help	Print help
 "#]]
     );
+}
+
+fn multi_value_tag_cmd() -> Command {
+    Command::new("tool")
+        .disable_help_flag(true)
+        .disable_version_flag(true)
+        .disable_help_subcommand(true)
+        .arg(
+            clap::Arg::new("tag")
+                .long("tag")
+                .num_args(1..=3)
+                .value_parser(["red", "blue", "green"]),
+        )
+        .arg(
+            clap::Arg::new("limit")
+                .long("limit")
+                .num_args(1)
+                .value_parser(["1", "2"]),
+        )
+        .arg(clap::Arg::new("root-pos").value_parser(["input", "output"]))
+        .subcommand(
+            Command::new("run")
+                .disable_help_flag(true)
+                .disable_version_flag(true)
+                .arg(
+                    clap::Arg::new("tag")
+                        .long("tag")
+                        .num_args(1..=3)
+                        .value_parser(["red", "blue", "green"]),
+                )
+                .arg(clap::Arg::new("run-pos").value_parser(["job", "log"])),
+        )
+}
+
+fn complete_multi_value_tag(args: &[&str]) -> Vec<CompletionCandidate> {
+    let mut cmd = multi_value_tag_cmd();
+    let args: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
+    let arg_index = args.len() - 1;
+    clap_complete::engine::complete(&mut cmd, args, arg_index, None).unwrap()
+}
+
+fn multi_value_tag_values(args: &[&str]) -> Vec<String> {
+    complete_multi_value_tag(args)
+        .into_iter()
+        .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+        .collect()
+}
+
+type CandidateMetadata = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<usize>,
+    bool,
+);
+
+fn candidate_metadata(candidates: Vec<CompletionCandidate>) -> Vec<CandidateMetadata> {
+    candidates
+        .into_iter()
+        .map(|candidate| {
+            (
+                candidate.get_value().to_string_lossy().into_owned(),
+                candidate.get_help().map(|help| help.to_string()),
+                candidate.get_id().cloned(),
+                candidate.get_tag().map(|tag| tag.to_string()),
+                candidate.get_display_order(),
+                candidate.is_hide_set(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn multi_value_tag_completes_only_remaining_values() {
+    // Until the maximum is reached every plain word is another `--tag` value:
+    // possible values can repeat, and no option, subcommand, or positional
+    // candidate may leak into the suggestions.
+    assert_eq!(
+        multi_value_tag_values(&["tool", "--tag", ""]),
+        ["red", "blue", "green"]
+    );
+    assert_eq!(
+        multi_value_tag_values(&["tool", "--tag", "red", ""]),
+        ["red", "blue", "green"]
+    );
+    assert_eq!(
+        multi_value_tag_values(&["tool", "--tag", "red", "blue", ""]),
+        ["red", "blue", "green"]
+    );
+    assert_eq!(
+        multi_value_tag_values(&["tool", "--tag", "red", "blue", "green", ""]),
+        ["run", "input", "output", "--tag", "--limit"]
+    );
+}
+
+#[test]
+fn multi_value_tag_prefix_filters_values() {
+    assert_eq!(
+        multi_value_tag_values(&["tool", "--tag", "r"]),
+        ["red"]
+    );
+    assert_eq!(
+        multi_value_tag_values(&["tool", "--tag", "red", "g"]),
+        ["green"]
+    );
+    assert_eq!(
+        multi_value_tag_values(&["tool", "--tag", "x"]),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn multi_value_tag_equals_matches_space_state() {
+    // An attached value counts toward the option's values, so completing the
+    // empty word after `--tag=red` must be identical to completing after
+    // `--tag red`, including every piece of candidate metadata.
+    let spaced = candidate_metadata(complete_multi_value_tag(&["tool", "--tag", "red", ""]));
+    let attached = candidate_metadata(complete_multi_value_tag(&["tool", "--tag=red", ""]));
+    assert_eq!(spaced, attached);
+    assert_eq!(
+        attached.iter().map(|c| c.0.clone()).collect::<Vec<_>>(),
+        ["red", "blue", "green"]
+    );
+
+    let spaced = candidate_metadata(complete_multi_value_tag(&[
+        "tool", "--tag", "red", "blue", "",
+    ]));
+    let attached = candidate_metadata(complete_multi_value_tag(&[
+        "tool", "--tag=red", "--tag", "blue", "",
+    ]));
+    assert_eq!(spaced, attached);
+
+    // The attached-value completion itself keeps its `--tag=` prefix.
+    assert_eq!(
+        multi_value_tag_values(&["tool", "--tag=r"]),
+        ["--tag=red"]
+    );
+}
+
+#[test]
+fn multi_value_tag_switches_to_other_option() {
+    // `--limit` is a new option, not another tag value: the pending tag must
+    // end as soon as a flag-like word appears once the minimum is satisfied.
+    assert_eq!(
+        multi_value_tag_values(&["tool", "--tag", "red", "--limit", ""]),
+        ["1", "2"]
+    );
+    assert_eq!(
+        multi_value_tag_values(&["tool", "--tag=red", "--limit", ""]),
+        ["1", "2"]
+    );
+
+    // A flag-like word while the minimum is still pending cannot be a value
+    // and the option is not yet satisfied, so completion is empty rather
+    // than leaking options (same as a single-value pending option).
+    assert_eq!(
+        multi_value_tag_values(&["tool", "--tag", "--l"]),
+        Vec::<String>::new()
+    );
+
+    // Once the minimum is met, a flag-like word switches instead: the
+    // matching option is offered.
+    assert_eq!(
+        multi_value_tag_values(&["tool", "--tag", "red", "--l"]),
+        ["--limit"]
+    );
+    assert_eq!(
+        multi_value_tag_values(&["tool", "--tag=red", "--l"]),
+        ["--limit"]
+    );
+
+    // `-` is stdio, not a flag, so it is consumed as an option value (no
+    // candidate); the literal `--` is a switch point like it is for
+    // multi-value positionals, so the remaining options are offered.
+    assert_eq!(
+        multi_value_tag_values(&["tool", "--tag", "red", "-"]),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        multi_value_tag_values(&["tool", "--tag", "red", "--"]),
+        ["--tag", "--limit"]
+    );
+}
+
+#[test]
+fn multi_value_tag_terminator_completes_positionals() {
+    assert_eq!(
+        multi_value_tag_values(&["tool", "--tag", "red", "--", ""]),
+        ["input", "output"]
+    );
+    assert_eq!(
+        multi_value_tag_values(&["tool", "--tag=red", "--", ""]),
+        ["input", "output"]
+    );
+
+    // After the terminator, flag-like text, the subcommand name, unknown
+    // words, and another `--` are positional values: never re-enter option
+    // parsing, never descend into `run`, and stay successful.
+    for word in ["--limit", "--tag", "--", "-x", "run", "unknown"] {
+        assert!(
+            multi_value_tag_values(&["tool", "--tag", "red", "--", word]).is_empty(),
+            "unexpected candidates for {word:?}"
+        );
+    }
+
+    // Prefix matching still applies to the root positional values.
+    assert_eq!(
+        multi_value_tag_values(&["tool", "--tag", "red", "--", "o"]),
+        ["output"]
+    );
+}
+
+#[test]
+fn multi_value_tag_works_inside_subcommand() {
+    assert_eq!(
+        multi_value_tag_values(&["tool", "run", "--tag", ""]),
+        ["red", "blue", "green"]
+    );
+    assert_eq!(
+        multi_value_tag_values(&["tool", "run", "--tag", "red", ""]),
+        ["red", "blue", "green"]
+    );
+    assert_eq!(
+        multi_value_tag_values(&["tool", "run", "--tag=red", ""]),
+        ["red", "blue", "green"]
+    );
+    assert_eq!(
+        multi_value_tag_values(&["tool", "run", "--tag", "red", "blue", "green", ""]),
+        ["job", "log", "--tag"]
+    );
+
+    // Stays at the `run` level after the terminator.
+    assert_eq!(
+        multi_value_tag_values(&["tool", "run", "--tag", "red", "--", ""]),
+        ["job", "log"]
+    );
+    assert_eq!(
+        multi_value_tag_values(&["tool", "run", "--tag=red", "--", "j"]),
+        ["job"]
+    );
+    for word in ["--tag", "--", "run", "bogus"] {
+        assert!(multi_value_tag_values(&["tool", "run", "--tag", "red", "--", word]).is_empty());
+    }
+}
+
+#[test]
+fn multi_value_tag_invalid_prior_values_still_complete() {
+    // A value the parser would reject must not abort completion or wipe out
+    // unrelated positional candidates later on the line.
+    assert_eq!(
+        multi_value_tag_values(&["tool", "--tag", "bogus", ""]),
+        ["red", "blue", "green"]
+    );
+    assert_eq!(
+        multi_value_tag_values(&["tool", "--tag=bogus", ""]),
+        ["red", "blue", "green"]
+    );
+    assert_eq!(
+        multi_value_tag_values(&["tool", "--tag", "bogus", "--limit", ""]),
+        ["1", "2"]
+    );
+    assert_eq!(
+        multi_value_tag_values(&["tool", "--tag", "bogus", "--", ""]),
+        ["input", "output"]
+    );
+
+    // A prefix with no possible-value match is a successful empty result.
+    assert_eq!(
+        multi_value_tag_values(&["tool", "--tag=bogus", "zzz"]),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn multi_value_tag_metadata_matches_across_forms_and_levels() {
+    // The retained tag candidates must carry identical text, help, id, tag,
+    // order, and hidden state regardless of space- or equals-separated input,
+    // at both the root and the subcommand level.
+    let cases: &[(&[&str], &[&str])] = &[
+        (
+            &["tool", "--tag", "red", "blue", ""],
+            &["tool", "--tag=red", "--tag", "blue", ""],
+        ),
+        (
+            &["tool", "run", "--tag", "red", ""],
+            &["tool", "run", "--tag=red", ""],
+        ),
+    ];
+    for (spaced, attached) in cases {
+        assert_eq!(
+            candidate_metadata(complete_multi_value_tag(spaced)),
+            candidate_metadata(complete_multi_value_tag(attached)),
+            "{spaced:?} vs {attached:?}"
+        );
+    }
 }
 
 fn complete(cmd: &mut Command, args: impl AsRef<str>, current_dir: Option<&Path>) -> String {

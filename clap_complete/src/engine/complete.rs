@@ -61,7 +61,7 @@ pub fn complete(
             );
         }
 
-        if !is_escaped {
+        if !is_escaped && !matches!(current_state, ParseState::Opt(..) | ParseState::Pos(..)) {
             if let Ok(value) = arg.to_value() {
                 if let Some(next_cmd) = current_cmd.find_subcommand(value) {
                     current_cmd = next_cmd;
@@ -88,8 +88,13 @@ pub fn complete(
 
                 if let Some(opt) = opt {
                     used_args.push(opt.get_id().clone());
-                    if opt.get_num_args().expect("built").takes_values() && value.is_none() {
-                        next_state = ParseState::Opt((opt, 1));
+                    if opt.get_num_args().expect("built").takes_values() {
+                        // An attached value (`--opt=value`) counts toward the
+                        // option's values just like a space-separated one, so
+                        // that completing after `--opt=value` sees the same
+                        // state as completing after `--opt value`.
+                        let count = value.map(|v| attached_value_count(opt, v)).unwrap_or(0);
+                        next_state = parse_opt_value(opt, count);
                     };
                 } else if pos_allows_hyphen(current_cmd, pos_index) {
                     (next_state, pos_index) =
@@ -101,9 +106,16 @@ pub fn complete(
                 parse_shortflags(current_cmd, short);
             used_args.extend(matched_opts.iter().map(|opt| opt.get_id().clone()));
             if let Some(opt) = takes_value_opt {
-                if short.next_value_os().is_none() {
-                    next_state = ParseState::Opt((opt, 1));
-                }
+                // An attached value (`-ovalue`, `-o=value`) counts toward the
+                // option's values just like a space-separated one.
+                let count = short
+                    .next_value_os()
+                    .map(|v| {
+                        let v = v.strip_prefix("=").unwrap_or(v);
+                        attached_value_count(opt, v)
+                    })
+                    .unwrap_or(0);
+                next_state = parse_opt_value(opt, count);
             } else if pos_allows_hyphen(current_cmd, pos_index) {
                 (next_state, pos_index) =
                     parse_positional(current_cmd, pos_index, is_escaped, current_state);
@@ -204,8 +216,10 @@ fn complete_arg(
                 count.saturating_sub(1),
             ));
             let min = opt.get_num_args().map(|r| r.min_values()).unwrap_or(0);
-            if count > min {
-                // Also complete this raw_arg as a positional argument, flags, options and subcommand.
+            if count > min && can_switch_to_other_arg(opt, arg) {
+                // The option's required values are satisfied and this word
+                // would be parsed as a new flag rather than another value, so
+                // also complete it as a positional, flag, option or subcommand.
                 completions.extend(complete_arg(
                     arg,
                     cmd,
@@ -785,6 +799,15 @@ fn parse_opt_value(opt: &clap::Arg, count: usize) -> ParseState<'_> {
     }
 }
 
+/// How many of an option's values an attached `=value` (or `-ovalue`) accounts
+/// for, honoring the value delimiter.
+fn attached_value_count(opt: &clap::Arg, value: &OsStr) -> usize {
+    match (opt.get_value_delimiter(), value.to_str()) {
+        (Some(delimiter), Some(value)) => value.split(delimiter).count(),
+        _ => 1,
+    }
+}
+
 fn pos_allows_hyphen(cmd: &clap::Command, pos_index: usize) -> bool {
     cmd.get_positionals()
         .find(|a| a.get_index() == Some(pos_index))
@@ -801,4 +824,31 @@ fn opt_allows_hyphen(state: &ParseState<'_>, arg: &clap_lex::ParsedArg<'_>) -> b
     }
 
     false
+}
+
+/// Whether a word can terminate a still-open multi-value option and start a
+/// new argument instead, the way the parser would read it.
+///
+/// While an option still owes values, the parser greedily consumes every plain
+/// word as one of its values; only flag-like words can switch to another
+/// argument. An option that accepts hyphen values consumes those too.
+fn can_switch_to_other_arg(pending: &clap::Arg, arg: &clap_lex::ParsedArg<'_>) -> bool {
+    if arg.is_escape() {
+        // `--` cancels every pending option unless its values may start with `--`.
+        return !pending.is_allow_hyphen_values_set();
+    }
+    if !arg.to_value_os().starts_with("-") {
+        // A plain word is always another value of the pending option.
+        return false;
+    }
+    if pending.is_allow_hyphen_values_set() {
+        return false;
+    }
+    // `-` is a stdio/value, not a flag.
+    if arg.is_stdio() {
+        return false;
+    }
+    // Both long and short flag styles can start a new argument; unknown flags
+    // still switch (and error during parsing) rather than become option values.
+    arg.to_long().is_some() || arg.to_short().is_some()
 }
