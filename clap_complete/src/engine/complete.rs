@@ -153,8 +153,10 @@ fn complete_arg(
 
     match state {
         ParseState::ValueDone => {
-            if let Ok(value) = arg.to_value() {
-                completions.extend(complete_subcommand(value, cmd));
+            if !is_escaped {
+                if let Ok(value) = arg.to_value() {
+                    completions.extend(complete_subcommand(value, cmd));
+                }
             }
 
             if let Some(positional) = cmd

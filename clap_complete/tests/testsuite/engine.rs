@@ -1595,6 +1595,155 @@ fn hidden_alias_shares_conflicts() {
     assert_eq!(completions, ["--verbose", "--quiet"]);
 }
 
+fn tool_escape_cmd() -> Command {
+    Command::new("tool")
+        .disable_help_flag(true)
+        .disable_version_flag(true)
+        .arg(
+            clap::Arg::new("config")
+                .long("config")
+                .value_parser(["dev", "prod"]),
+        )
+        .arg(clap::Arg::new("positional").value_parser(["alpha", "beta"]))
+        .subcommand(
+            Command::new("run")
+                .arg(
+                    clap::Arg::new("format")
+                        .long("format")
+                        .value_parser(["text", "json"]),
+                )
+                .arg(clap::Arg::new("input").value_parser(["one", "two"])),
+        )
+}
+
+fn complete_tool_escape(args: &[&str]) -> Vec<CompletionCandidate> {
+    let mut cmd = tool_escape_cmd();
+    let args: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
+    let arg_index = args.len() - 1;
+    clap_complete::engine::complete(&mut cmd, args, arg_index, None).unwrap()
+}
+
+fn candidate_values(candidates: &[CompletionCandidate]) -> Vec<String> {
+    candidates
+        .iter()
+        .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// Every observable field of a candidate, for metadata parity checks.
+type CandidateMetadata = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<usize>,
+    bool,
+);
+
+fn candidate_metadata(candidates: &[CompletionCandidate]) -> Vec<CandidateMetadata> {
+    candidates
+        .iter()
+        .map(|candidate| {
+            (
+                candidate.get_value().to_string_lossy().into_owned(),
+                candidate.get_help().map(|h| h.to_string()),
+                candidate.get_id().cloned(),
+                candidate.get_tag().map(|t| t.to_string()),
+                candidate.get_display_order(),
+                candidate.is_hide_set(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn pending_option_value_completes_only_its_values() {
+    assert_eq!(
+        candidate_values(&complete_tool_escape(&["tool", "--config", ""])),
+        ["dev", "prod"]
+    );
+    assert_eq!(
+        candidate_values(&complete_tool_escape(&["tool", "run", "--format", ""])),
+        ["text", "json"]
+    );
+}
+
+#[test]
+fn pending_option_value_with_flag_like_prefix_is_empty() {
+    // A flag-like word while an option value is pending must not leak
+    // options, subcommands, or positional values.
+    assert!(complete_tool_escape(&["tool", "--config", "--f"]).is_empty());
+    assert!(complete_tool_escape(&["tool", "run", "--format", "--f"]).is_empty());
+}
+
+#[test]
+fn escape_cancels_pending_option_value() {
+    // `--` cancels the pending `--config` value; only root positionals remain.
+    assert_eq!(
+        candidate_values(&complete_tool_escape(&["tool", "--config", "--", ""])),
+        ["alpha", "beta"]
+    );
+    assert_eq!(
+        candidate_values(&complete_tool_escape(&["tool", "run", "--format", "--", ""])),
+        ["one", "two"]
+    );
+}
+
+#[test]
+fn flag_like_word_after_escape_is_empty() {
+    assert!(complete_tool_escape(&["tool", "--config", "--", "--f"]).is_empty());
+    assert!(complete_tool_escape(&["tool", "run", "--format", "--", "--f"]).is_empty());
+}
+
+#[test]
+fn pre_escape_behavior_is_unchanged() {
+    assert_eq!(
+        candidate_values(&complete_tool_escape(&["tool", "--c"])),
+        ["--config"]
+    );
+    assert_eq!(
+        candidate_values(&complete_tool_escape(&["tool", "--config", "d"])),
+        ["dev"]
+    );
+    assert_eq!(
+        candidate_values(&complete_tool_escape(&["tool", "run", "--format", "j"])),
+        ["json"]
+    );
+}
+
+#[test]
+fn out_of_range_positional_after_escape_is_empty() {
+    // The root only has one positional; a second word after `--` is out of
+    // range and must succeed with no candidates.
+    assert!(complete_tool_escape(&["tool", "--", "alpha", ""]).is_empty());
+    assert!(complete_tool_escape(&["tool", "--", "alpha", "beta", ""]).is_empty());
+    // Same within the subcommand; no falling back to the parent's positionals.
+    assert!(complete_tool_escape(&["tool", "run", "--", "one", ""]).is_empty());
+    assert!(complete_tool_escape(&["tool", "run", "--", "one", "two", ""]).is_empty());
+}
+
+#[test]
+fn escape_preserves_candidate_metadata() {
+    // Cancelling the pending value may only change the candidate set, never
+    // the metadata of the candidates that remain.
+    let without_escape = candidate_metadata(&complete_tool_escape(&["tool", ""]));
+    let with_escape = candidate_metadata(&complete_tool_escape(&["tool", "--config", "--", ""]));
+    let retained: Vec<_> = without_escape
+        .into_iter()
+        .filter(|(value, ..)| value == "alpha" || value == "beta")
+        .collect();
+    assert_eq!(retained, with_escape);
+
+    let without_escape = candidate_metadata(&complete_tool_escape(&["tool", "run", ""]));
+    let with_escape =
+        candidate_metadata(&complete_tool_escape(&["tool", "run", "--format", "--", ""]));
+    let retained: Vec<_> = without_escape
+        .into_iter()
+        .filter(|(value, ..)| value == "one" || value == "two")
+        .collect();
+    assert_eq!(retained, with_escape);
+}
+
 #[test]
 fn sort_and_filter() {
     let mut cmd = Command::new("exhaustive")
