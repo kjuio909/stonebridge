@@ -1595,6 +1595,152 @@ fn hidden_alias_shares_conflicts() {
     assert_eq!(completions, ["--verbose", "--quiet"]);
 }
 
+fn terminator_tool_cmd() -> Command {
+    Command::new("tool")
+        .disable_help_flag(true)
+        .disable_version_flag(true)
+        .disable_help_subcommand(true)
+        .arg(
+            clap::Arg::new("config")
+                .long("config")
+                .value_parser(["dev", "prod"]),
+        )
+        .arg(clap::Arg::new("root-pos").value_parser(["alpha", "beta"]))
+        .subcommand(
+            Command::new("run")
+                .disable_help_flag(true)
+                .disable_version_flag(true)
+                .arg(
+                    clap::Arg::new("format")
+                        .long("format")
+                        .value_parser(["text", "json"]),
+                )
+                .arg(clap::Arg::new("run-pos").value_parser(["one", "two"])),
+        )
+}
+
+fn complete_terminator_tool(args: &[&str]) -> Vec<CompletionCandidate> {
+    let mut cmd = terminator_tool_cmd();
+    let args: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
+    let arg_index = args.len() - 1;
+    clap_complete::engine::complete(&mut cmd, args, arg_index, None).unwrap()
+}
+
+fn terminator_tool_values(args: &[&str]) -> Vec<String> {
+    complete_terminator_tool(args)
+        .into_iter()
+        .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+        .collect()
+}
+
+#[test]
+fn pending_option_value_completes_only_its_values() {
+    assert_eq!(
+        terminator_tool_values(&["tool", "--config", ""]),
+        ["dev", "prod"]
+    );
+    assert_eq!(
+        terminator_tool_values(&["tool", "run", "--format", ""]),
+        ["text", "json"]
+    );
+}
+
+#[test]
+fn pending_option_value_with_flag_like_prefix_is_empty() {
+    // A flag-like word while an option value is pending must succeed with no
+    // candidates, not leak options, subcommands, or positional values.
+    assert!(terminator_tool_values(&["tool", "--config", "--f"]).is_empty());
+    assert!(terminator_tool_values(&["tool", "run", "--format", "--f"]).is_empty());
+}
+
+#[test]
+fn terminator_after_pending_option_value_completes_positionals() {
+    // `--` cancels the pending option value; only positionals are offered,
+    // not the pending option, other options, or subcommands.
+    assert_eq!(
+        terminator_tool_values(&["tool", "--config", "--", ""]),
+        ["alpha", "beta"]
+    );
+    assert_eq!(
+        terminator_tool_values(&["tool", "run", "--format", "--", ""]),
+        ["one", "two"]
+    );
+}
+
+#[test]
+fn flag_like_word_after_terminator_is_empty() {
+    assert!(terminator_tool_values(&["tool", "--config", "--", "--f"]).is_empty());
+    assert!(terminator_tool_values(&["tool", "run", "--format", "--", "--f"]).is_empty());
+}
+
+#[test]
+fn pre_terminator_behavior_is_unchanged() {
+    assert_eq!(terminator_tool_values(&["tool", "--c"]), ["--config"]);
+    assert_eq!(terminator_tool_values(&["tool", "--config", "d"]), ["dev"]);
+    assert_eq!(
+        terminator_tool_values(&["tool", "run", "--format", "j"]),
+        ["json"]
+    );
+}
+
+#[test]
+fn out_of_range_positional_after_terminator_is_empty() {
+    // Positional slots are exhausted; completion must succeed with no
+    // candidates rather than erroring or falling back to the parent command.
+    assert!(terminator_tool_values(&["tool", "--", "alpha", ""]).is_empty());
+    assert!(terminator_tool_values(&["tool", "run", "--", "one", ""]).is_empty());
+}
+
+#[test]
+fn terminator_preserves_candidate_metadata() {
+    // Cancelling the pending option value may only shrink the candidate set;
+    // the retained candidates must be byte-for-byte identical in value, help,
+    // id, tag, display order, and hidden state.
+    type CandidateMetadata = (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<usize>,
+        bool,
+    );
+    fn metadata(candidates: Vec<CompletionCandidate>) -> Vec<CandidateMetadata> {
+        candidates
+            .into_iter()
+            .map(|candidate| {
+                (
+                    candidate.get_value().to_string_lossy().into_owned(),
+                    candidate.get_help().map(|help| help.to_string()),
+                    candidate.get_id().cloned(),
+                    candidate.get_tag().map(|tag| tag.to_string()),
+                    candidate.get_display_order(),
+                    candidate.is_hide_set(),
+                )
+            })
+            .collect()
+    }
+
+    let plain = metadata(complete_terminator_tool(&["tool", ""]));
+    let escaped = metadata(complete_terminator_tool(&["tool", "--config", "--", ""]));
+    let expected: Vec<_> = plain
+        .iter()
+        .filter(|candidate| candidate.0 == "alpha" || candidate.0 == "beta")
+        .cloned()
+        .collect();
+    assert_eq!(escaped, expected);
+
+    let plain = metadata(complete_terminator_tool(&["tool", "run", ""]));
+    let escaped = metadata(complete_terminator_tool(&[
+        "tool", "run", "--format", "--", "",
+    ]));
+    let expected: Vec<_> = plain
+        .iter()
+        .filter(|candidate| candidate.0 == "one" || candidate.0 == "two")
+        .cloned()
+        .collect();
+    assert_eq!(escaped, expected);
+}
+
 #[test]
 fn sort_and_filter() {
     let mut cmd = Command::new("exhaustive")
