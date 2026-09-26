@@ -2206,6 +2206,339 @@ fn multi_value_tag_metadata_matches_across_forms_and_levels() {
     }
 }
 
+fn optional_value_tool_cmd() -> Command {
+    Command::new("tool")
+        .disable_help_flag(true)
+        .disable_version_flag(true)
+        .disable_help_subcommand(true)
+        .arg(
+            clap::Arg::new("color")
+                .long("color")
+                .num_args(0..=1)
+                .value_parser(["auto", "always", "never"])
+                .conflicts_with("quiet"),
+        )
+        .arg(
+            clap::Arg::new("mode")
+                .long("mode")
+                .value_parser(["fast", "slow"]),
+        )
+        .arg(
+            clap::Arg::new("quiet")
+                .long("quiet")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(clap::Arg::new("root-pos").value_parser(["src", "dst"]))
+        .subcommand(
+            Command::new("run")
+                .disable_help_flag(true)
+                .disable_version_flag(true)
+                .arg(
+                    clap::Arg::new("color")
+                        .long("color")
+                        .num_args(0..=1)
+                        .value_parser(["auto", "always", "never"]),
+                )
+                .arg(clap::Arg::new("run-pos").value_parser(["job", "log"])),
+        )
+}
+
+fn complete_optional_value_tool(args: &[&str]) -> Vec<CompletionCandidate> {
+    let mut cmd = optional_value_tool_cmd();
+    let args: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
+    let arg_index = args.len() - 1;
+    clap_complete::engine::complete(&mut cmd, args, arg_index, None).unwrap()
+}
+
+fn optional_value_tool_values(args: &[&str]) -> Vec<String> {
+    complete_optional_value_tool(args)
+        .into_iter()
+        .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+        .collect()
+}
+
+#[test]
+fn pending_optional_value_completes_only_its_values() {
+    // `--color` may stand alone, but while it is pending a plain word is its
+    // value, so only colors are offered.
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color", ""]),
+        ["auto", "always", "never"]
+    );
+    assert_eq!(
+        optional_value_tool_values(&["tool", "run", "--color", ""]),
+        ["auto", "always", "never"]
+    );
+
+    // Prefix filtering still applies within the pending value.
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color", "a"]),
+        ["auto", "always"]
+    );
+    assert_eq!(
+        optional_value_tool_values(&["tool", "run", "--color", "n"]),
+        ["never"]
+    );
+}
+
+#[test]
+fn pending_optional_value_switches_to_next_option() {
+    // A flag-like word cannot be the optional value: `--color` is treated as
+    // not provided and the new option's values are completed.
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color", "--mode", ""]),
+        ["fast", "slow"]
+    );
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color", "--mode", "f"]),
+        ["fast"]
+    );
+
+    // At the `run` level the pending `--color` likewise stands alone when the
+    // next word is flag-like; only `run`-level candidates are offered.
+    assert_eq!(
+        optional_value_tool_values(&["tool", "run", "--color", "--c"]),
+        ["--color"]
+    );
+
+    // A flag-like prefix completes options, not color values.
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color", "--m"]),
+        ["--mode"]
+    );
+    // The pending `--color` still counts as present, so the conflicting
+    // `--quiet` is filtered out.
+    assert!(optional_value_tool_values(&["tool", "--color", "--q"]).is_empty());
+}
+
+#[test]
+fn optional_value_equals_form_is_preserved() {
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color="]),
+        ["--color=auto", "--color=always", "--color=never"]
+    );
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color=a"]),
+        ["--color=auto", "--color=always"]
+    );
+    assert_eq!(
+        optional_value_tool_values(&["tool", "run", "--color="]),
+        ["--color=auto", "--color=always", "--color=never"]
+    );
+}
+
+#[test]
+fn optional_value_option_can_repeat() {
+    // After a complete color, another `--color` can still take a value.
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color", "auto", "--color", ""]),
+        ["auto", "always", "never"]
+    );
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color=auto", "--color", ""]),
+        ["auto", "always", "never"]
+    );
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color", "auto", "--color="]),
+        ["--color=auto", "--color=always", "--color=never"]
+    );
+
+    // A pending `--color` followed by another `--color`: the first one stands
+    // alone and the second one is completed.
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color", "--color", ""]),
+        ["auto", "always", "never"]
+    );
+    assert_eq!(
+        optional_value_tool_values(&["tool", "run", "--color", "always", "--color", ""]),
+        ["auto", "always", "never"]
+    );
+}
+
+#[test]
+fn pending_optional_value_terminated_by_escape() {
+    // `--` cancels the pending optional value; only the current level's
+    // positionals are offered from then on.
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color", "--", ""]),
+        ["src", "dst"]
+    );
+    assert_eq!(
+        optional_value_tool_values(&["tool", "run", "--color", "--", ""]),
+        ["job", "log"]
+    );
+
+    // The `run` level must not fall back to root positionals.
+    assert!(optional_value_tool_values(&["tool", "run", "--color", "--", "src"]).is_empty());
+
+    // Option-style words, the subcommand name, and unknown words after `--`
+    // are positional values that match nothing: successful empty results.
+    for word in ["--color", "--mode", "-x", "run", "bogus"] {
+        assert!(optional_value_tool_values(&["tool", "--color", "--", word]).is_empty());
+        assert!(optional_value_tool_values(&["tool", "run", "--color", "--", word]).is_empty());
+    }
+
+    // Prefix filtering of the current level's positionals still applies.
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color", "--", "s"]),
+        ["src"]
+    );
+    assert_eq!(
+        optional_value_tool_values(&["tool", "run", "--color", "--", "j"]),
+        ["job"]
+    );
+}
+
+#[test]
+fn optional_value_conflicts_filter_candidates() {
+    // `--quiet` is present: the conflicting `--color` is excluded while
+    // unrelated candidates remain.
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--quiet", ""]),
+        ["run", "src", "dst", "--mode", "--quiet"]
+    );
+
+    // A completed `--color` excludes `--quiet`.
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color", "auto", ""]),
+        ["run", "src", "dst", "--color", "--mode"]
+    );
+
+    // A conflicting pair already on the command line must not error or clear
+    // unrelated candidates.
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color", "auto", "--quiet", ""]),
+        ["run", "src", "dst", "--mode"]
+    );
+
+    // A pending `--color` still completes its values despite the conflict.
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--quiet", "--color", ""]),
+        ["auto", "always", "never"]
+    );
+}
+
+#[test]
+fn optional_value_invalid_prior_words_still_complete() {
+    let all = ["run", "src", "dst", "--color", "--mode", "--quiet"];
+
+    // Illegal values, attached or separate, must not error or clear
+    // unrelated candidates.
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--mode", "bogus", ""]),
+        all
+    );
+    // An invalid `--color` value still counts as `--color` being used, so the
+    // conflicting `--quiet` is filtered while everything else remains.
+    let without_quiet = ["run", "src", "dst", "--color", "--mode"];
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color", "bogus", ""]),
+        without_quiet
+    );
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color=bogus", ""]),
+        without_quiet
+    );
+
+    // Unknown options on the line must not break completion either.
+    assert_eq!(optional_value_tool_values(&["tool", "--bogus", ""]), all);
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--bogus", "--color", ""]),
+        ["auto", "always", "never"]
+    );
+
+    // Positional slots exhausted: a successful empty result, not an error or
+    // a fallback to another level.
+    assert!(optional_value_tool_values(&["tool", "--", "src", ""]).is_empty());
+    assert!(optional_value_tool_values(&["tool", "run", "--", "job", ""]).is_empty());
+
+    // A prefix with no match is a successful empty result.
+    assert!(optional_value_tool_values(&["tool", "--color", "x"]).is_empty());
+    assert!(optional_value_tool_values(&["tool", "--color=x"]).is_empty());
+    assert!(optional_value_tool_values(&["tool", "run", "--color", "x"]).is_empty());
+}
+
+#[test]
+fn optional_value_preserves_candidate_metadata() {
+    // Value, help, id, tag, display order, and hidden state of the retained
+    // candidates must be identical regardless of how earlier words were
+    // written or which level they were on.
+    type CandidateMetadata = (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<usize>,
+        bool,
+    );
+    fn metadata(candidates: Vec<CompletionCandidate>) -> Vec<CandidateMetadata> {
+        candidates
+            .into_iter()
+            .map(|candidate| {
+                (
+                    candidate.get_value().to_string_lossy().into_owned(),
+                    candidate.get_help().map(|help| help.to_string()),
+                    candidate.get_id().cloned(),
+                    candidate.get_tag().map(|tag| tag.to_string()),
+                    candidate.get_display_order(),
+                    candidate.is_hide_set(),
+                )
+            })
+            .collect()
+    }
+
+    // Space-separated and equals-separated prior occurrences complete the
+    // same pending `--color`.
+    let spaced = metadata(complete_optional_value_tool(&[
+        "tool", "--color", "auto", "--color", "",
+    ]));
+    let attached = metadata(complete_optional_value_tool(&[
+        "tool", "--color=auto", "--color", "",
+    ]));
+    assert_eq!(spaced, attached);
+
+    // The nested `run` level defines the same `--color`; its candidates carry
+    // the same metadata as the root level's.
+    let root = metadata(complete_optional_value_tool(&["tool", "--color", ""]));
+    let nested = metadata(complete_optional_value_tool(&["tool", "run", "--color", ""]));
+    assert_eq!(root, nested);
+
+    // The equals form only adds the `--color=` prefix to each value; every
+    // other piece of metadata is untouched.
+    let equals = metadata(complete_optional_value_tool(&["tool", "--color="]));
+    assert_eq!(root.len(), equals.len());
+    for (spaced, equals) in root.iter().zip(equals.iter()) {
+        assert_eq!(format!("--color={}", spaced.0), equals.0);
+        assert_eq!(spaced.1, equals.1);
+        assert_eq!(spaced.2, equals.2);
+        assert_eq!(spaced.3, equals.3);
+        assert_eq!(spaced.4, equals.4);
+        assert_eq!(spaced.5, equals.5);
+    }
+
+    // Cancelling the pending value with `--` may only shrink the candidate
+    // set; the retained positionals are byte-for-byte identical.
+    let plain = metadata(complete_optional_value_tool(&["tool", ""]));
+    let escaped = metadata(complete_optional_value_tool(&["tool", "--color", "--", ""]));
+    let expected: Vec<_> = plain
+        .iter()
+        .filter(|candidate| candidate.0 == "src" || candidate.0 == "dst")
+        .cloned()
+        .collect();
+    assert_eq!(escaped, expected);
+
+    let plain = metadata(complete_optional_value_tool(&["tool", "run", ""]));
+    let escaped = metadata(complete_optional_value_tool(&[
+        "tool", "run", "--color", "--", "",
+    ]));
+    let expected: Vec<_> = plain
+        .iter()
+        .filter(|candidate| candidate.0 == "job" || candidate.0 == "log")
+        .cloned()
+        .collect();
+    assert_eq!(escaped, expected);
+}
+
 fn complete(cmd: &mut Command, args: impl AsRef<str>, current_dir: Option<&Path>) -> String {
     let input = args.as_ref();
     let mut args = vec![std::ffi::OsString::from(cmd.get_name())];
