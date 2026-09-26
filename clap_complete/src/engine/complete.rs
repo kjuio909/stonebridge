@@ -88,9 +88,11 @@ pub fn complete(
 
                 if let Some(opt) = opt {
                     used_args.push(opt.get_id().clone());
-                    if opt.get_num_args().expect("built").takes_values() && value.is_none() {
-                        next_state = ParseState::Opt((opt, 1));
-                    };
+                    let num_args = opt.get_num_args().expect("built");
+                    let num_consumed = usize::from(value.is_some());
+                    if num_consumed < num_args.max_values() {
+                        next_state = ParseState::Opt((opt, num_consumed + 1));
+                    }
                 } else if pos_allows_hyphen(current_cmd, pos_index) {
                     (next_state, pos_index) =
                         parse_positional(current_cmd, pos_index, is_escaped, current_state);
@@ -101,8 +103,9 @@ pub fn complete(
                 parse_shortflags(current_cmd, short);
             used_args.extend(matched_opts.iter().map(|opt| opt.get_id().clone()));
             if let Some(opt) = takes_value_opt {
-                if short.next_value_os().is_none() {
-                    next_state = ParseState::Opt((opt, 1));
+                let num_consumed = usize::from(short.next_value_os().is_some());
+                if num_consumed < opt.get_num_args().expect("built").max_values() {
+                    next_state = ParseState::Opt((opt, num_consumed + 1));
                 }
             } else if pos_allows_hyphen(current_cmd, pos_index) {
                 (next_state, pos_index) =
@@ -197,25 +200,15 @@ fn complete_arg(
             }
         }
         ParseState::Opt((opt, count)) => {
+            // The option can still consume this word as a value, so only its
+            // values are completed; options, subcommands, and positionals are
+            // not offered until the option is done taking values.
             completions.extend(complete_arg_value(
                 arg.to_value(),
                 opt,
                 current_dir,
                 count.saturating_sub(1),
             ));
-            let min = opt.get_num_args().map(|r| r.min_values()).unwrap_or(0);
-            if count > min {
-                // Also complete this raw_arg as a positional argument, flags, options and subcommand.
-                completions.extend(complete_arg(
-                    arg,
-                    cmd,
-                    current_dir,
-                    pos_index,
-                    is_escaped,
-                    ParseState::ValueDone,
-                    used_args,
-                )?);
-            }
         }
     }
     filter_conflicting_candidates(&mut completions, cmd, used_args);

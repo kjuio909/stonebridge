@@ -457,9 +457,6 @@ val3
 val1
 val2
 val3
---certain-num
---uncertain-num
---help	Print help
 "#]]
     );
 
@@ -514,9 +511,6 @@ val3
 val1
 val2
 val3
---certain-num
---uncertain-num
---help	Print help
 "#]]
     );
 
@@ -1838,6 +1832,227 @@ fn terminator_preserves_candidate_metadata() {
 
     let escaped = metadata(complete_terminator_tool(&["tool", "run", "--", ""]));
     assert_eq!(escaped, expected);
+}
+
+fn tag_tool_cmd() -> Command {
+    let tag = || {
+        clap::Arg::new("tag")
+            .long("tag")
+            .value_parser(["red", "blue", "green"])
+            .num_args(1..=3)
+    };
+    let limit = || {
+        clap::Arg::new("limit")
+            .long("limit")
+            .value_parser(["1", "2"])
+            .num_args(1)
+    };
+    Command::new("tool")
+        .disable_help_flag(true)
+        .disable_version_flag(true)
+        .arg(tag())
+        .arg(limit())
+        .arg(clap::Arg::new("input").value_parser(["input", "output"]))
+        .subcommand(
+            Command::new("run")
+                .disable_help_flag(true)
+                .disable_version_flag(true)
+                .arg(tag())
+                .arg(limit())
+                .arg(clap::Arg::new("job").value_parser(["job", "log"])),
+        )
+}
+
+fn complete_tag_tool(args: &[&str]) -> Vec<CompletionCandidate> {
+    let mut cmd = tag_tool_cmd();
+    let args: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
+    let arg_index = args.len() - 1;
+    clap_complete::engine::complete(&mut cmd, args, arg_index, None).unwrap()
+}
+
+fn tag_tool_values(args: &[&str]) -> Vec<String> {
+    complete_tag_tool(args)
+        .into_iter()
+        .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+        .collect()
+}
+
+#[test]
+fn pending_multi_value_option_completes_only_its_values() {
+    // `--tag` takes one to three values; while it can still consume the word
+    // under the cursor, only its values are offered.  Options, subcommands,
+    // and positional values must not leak into the candidates.
+    assert_eq!(
+        tag_tool_values(&["tool", "--tag", ""]),
+        ["red", "blue", "green"]
+    );
+    assert_eq!(
+        tag_tool_values(&["tool", "--tag", "red", ""]),
+        ["red", "blue", "green"]
+    );
+    assert_eq!(
+        tag_tool_values(&["tool", "--tag", "red", "blue", ""]),
+        ["red", "blue", "green"]
+    );
+}
+
+#[test]
+fn multi_value_option_equals_form_matches_spaced_form() {
+    // `--tag=red` consumes the first value inline; the option can still take
+    // more values, so the following word must complete exactly like the
+    // spaced form, down to the candidate metadata.
+    type CandidateMetadata = (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<usize>,
+        bool,
+    );
+    fn metadata(candidates: Vec<CompletionCandidate>) -> Vec<CandidateMetadata> {
+        candidates
+            .into_iter()
+            .map(|candidate| {
+                (
+                    candidate.get_value().to_string_lossy().into_owned(),
+                    candidate.get_help().map(|help| help.to_string()),
+                    candidate.get_id().cloned(),
+                    candidate.get_tag().map(|tag| tag.to_string()),
+                    candidate.get_display_order(),
+                    candidate.is_hide_set(),
+                )
+            })
+            .collect()
+    }
+
+    let spaced = metadata(complete_tag_tool(&["tool", "--tag", "red", ""]));
+    let equals = metadata(complete_tag_tool(&["tool", "--tag=red", ""]));
+    assert_eq!(equals, spaced);
+    assert_eq!(
+        equals.iter().map(|candidate| &candidate.0).collect::<Vec<_>>(),
+        ["red", "blue", "green"]
+    );
+
+    assert_eq!(
+        tag_tool_values(&["tool", "--tag=red", "blue", ""]),
+        ["red", "blue", "green"]
+    );
+}
+
+#[test]
+fn multi_value_option_done_after_max_values() {
+    // Once `--tag` has all three values, it is done and the next word
+    // completes like any other word at this level.
+    let completions = tag_tool_values(&["tool", "--tag", "red", "blue", "green", ""]);
+    assert!(completions.contains(&"--tag".to_owned()));
+    assert!(completions.contains(&"--limit".to_owned()));
+    assert!(completions.contains(&"run".to_owned()));
+    assert!(completions.contains(&"input".to_owned()));
+    assert!(!completions.contains(&"red".to_owned()));
+}
+
+#[test]
+fn multi_value_option_switches_to_next_option() {
+    // A flag-like word ends `--tag`'s values; `--limit` must not be swallowed
+    // as a tag value and completes its own values.
+    assert_eq!(
+        tag_tool_values(&["tool", "--tag", "red", "--limit", ""]),
+        ["1", "2"]
+    );
+    assert_eq!(
+        tag_tool_values(&["tool", "--tag=red", "--limit", ""]),
+        ["1", "2"]
+    );
+    assert_eq!(
+        tag_tool_values(&["tool", "--tag", "red", "blue", "green", "--limit", ""]),
+        ["1", "2"]
+    );
+    assert_eq!(
+        tag_tool_values(&["tool", "--tag", "red", "--limit", "1", "--tag", ""]),
+        ["red", "blue", "green"]
+    );
+}
+
+#[test]
+fn multi_value_option_terminator_completes_positionals() {
+    // `--` ends `--tag`'s values and escapes the rest of the command line;
+    // only the current level's positional values are offered.
+    assert_eq!(
+        tag_tool_values(&["tool", "--tag", "red", "--", ""]),
+        ["input", "output"]
+    );
+    assert_eq!(
+        tag_tool_values(&["tool", "--tag=red", "--", ""]),
+        ["input", "output"]
+    );
+    // Value parsing is not resumed after the terminator: option-style words,
+    // subcommand names, and unknown words are positional values and complete
+    // to a successful empty result.
+    assert!(tag_tool_values(&["tool", "--tag", "red", "--", "--limit"]).is_empty());
+    assert!(tag_tool_values(&["tool", "--tag", "red", "--", "run"]).is_empty());
+    assert!(tag_tool_values(&["tool", "--tag", "red", "--", "bogus"]).is_empty());
+    // A subcommand name after `--` is a positional value, not a descent into
+    // `run`; with the root positional slot filled, nothing is left to offer.
+    assert!(tag_tool_values(&["tool", "--tag", "red", "--", "run", ""]).is_empty());
+    assert!(tag_tool_values(&["tool", "--tag", "red", "--", "input", ""]).is_empty());
+}
+
+#[test]
+fn nested_multi_value_option_does_not_fall_back_to_root() {
+    // The same behaviors hold inside `run`, scoped to `run`'s own arguments.
+    assert_eq!(
+        tag_tool_values(&["tool", "run", "--tag", ""]),
+        ["red", "blue", "green"]
+    );
+    assert_eq!(
+        tag_tool_values(&["tool", "run", "--tag", "red", ""]),
+        ["red", "blue", "green"]
+    );
+    assert_eq!(
+        tag_tool_values(&["tool", "run", "--tag=red", ""]),
+        ["red", "blue", "green"]
+    );
+    assert_eq!(
+        tag_tool_values(&["tool", "run", "--tag", "red", "--limit", ""]),
+        ["1", "2"]
+    );
+    assert_eq!(
+        tag_tool_values(&["tool", "run", "--tag", "red", "--", ""]),
+        ["job", "log"]
+    );
+    assert!(tag_tool_values(&["tool", "run", "--tag", "red", "--", "--limit"]).is_empty());
+    assert!(tag_tool_values(&["tool", "run", "--tag", "red", "--", "job", ""]).is_empty());
+}
+
+#[test]
+fn invalid_multi_value_option_value_still_completes() {
+    // An invalid `--tag` value earlier on the command line is a parse error
+    // for `clap` but must not fail completion or clear unrelated positions.
+    assert_eq!(
+        tag_tool_values(&["tool", "--tag", "purple", ""]),
+        ["red", "blue", "green"]
+    );
+    assert_eq!(
+        tag_tool_values(&["tool", "--tag", "purple", "--limit", ""]),
+        ["1", "2"]
+    );
+    assert_eq!(
+        tag_tool_values(&["tool", "--tag", "purple", "--", ""]),
+        ["input", "output"]
+    );
+    assert_eq!(
+        tag_tool_values(&["tool", "run", "--tag", "purple", "--", ""]),
+        ["job", "log"]
+    );
+}
+
+#[test]
+fn multi_value_option_without_prefix_match_is_empty() {
+    // No possible value matches the prefix: a successful empty result.
+    assert!(tag_tool_values(&["tool", "--tag", "x"]).is_empty());
+    assert!(tag_tool_values(&["tool", "--tag", "red", "x"]).is_empty());
+    assert!(tag_tool_values(&["tool", "--tag=red", "x"]).is_empty());
+    assert!(tag_tool_values(&["tool", "run", "--tag", "red", "x"]).is_empty());
 }
 
 #[test]

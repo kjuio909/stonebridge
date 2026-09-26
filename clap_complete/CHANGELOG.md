@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
 
+### Fixes
+
+- *(dynamic)* Don't leak options, subcommands, or positional values while an option can still take more values
+- *(dynamic)* Continue an option's values after `--opt=value` when it can take more values
+
 ## [4.6.10] - 2026-09-14
 
 ## [4.6.9] - 2026-08-06
