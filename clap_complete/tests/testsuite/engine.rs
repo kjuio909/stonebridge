@@ -2206,6 +2206,323 @@ fn multi_value_tag_metadata_matches_across_forms_and_levels() {
     }
 }
 
+fn optional_value_tool_cmd() -> Command {
+    let color_values = [
+        PossibleValue::new("auto").help("Use colors when the terminal supports them"),
+        PossibleValue::new("always").help("Always use colors"),
+        PossibleValue::new("never").help("Never use colors"),
+    ];
+    Command::new("tool")
+        .disable_help_flag(true)
+        .disable_version_flag(true)
+        .disable_help_subcommand(true)
+        .arg(
+            clap::Arg::new("color")
+                .long("color")
+                .num_args(0..=1)
+                .action(clap::ArgAction::Append)
+                .value_parser(color_values.clone())
+                .conflicts_with("quiet"),
+        )
+        .arg(
+            clap::Arg::new("mode")
+                .long("mode")
+                .value_parser(["fast", "slow"]),
+        )
+        .arg(
+            clap::Arg::new("quiet")
+                .long("quiet")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(clap::Arg::new("src").value_parser(["src-a", "src-b"]))
+        .arg(clap::Arg::new("dst").value_parser(["dst-a", "dst-b"]))
+        .subcommand(
+            Command::new("run")
+                .disable_help_flag(true)
+                .disable_version_flag(true)
+                .arg(
+                    clap::Arg::new("color")
+                        .long("color")
+                        .num_args(0..=1)
+                        .action(clap::ArgAction::Append)
+                        .value_parser(color_values),
+                )
+                .arg(clap::Arg::new("job").value_parser(["job-a", "job-b"]))
+                .arg(clap::Arg::new("log").value_parser(["log-a", "log-b"])),
+        )
+}
+
+fn complete_optional_value_tool(args: &[&str]) -> Vec<CompletionCandidate> {
+    let mut cmd = optional_value_tool_cmd();
+    let args: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
+    let arg_index = args.len() - 1;
+    clap_complete::engine::complete(&mut cmd, args, arg_index, None).unwrap()
+}
+
+fn optional_value_tool_values(args: &[&str]) -> Vec<String> {
+    complete_optional_value_tool(args)
+        .into_iter()
+        .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+        .collect()
+}
+
+#[test]
+fn optional_value_pending_completes_only_color_values() {
+    // With the cursor right after `--color`, the pending optional value may
+    // only offer the color values: no option, subcommand, or positional
+    // candidate may leak in, even though the minimum (zero values) is met.
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color", ""]),
+        ["auto", "always", "never"]
+    );
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color", "a"]),
+        ["auto", "always"]
+    );
+    assert_eq!(
+        optional_value_tool_values(&["tool", "run", "--color", ""]),
+        ["auto", "always", "never"]
+    );
+    assert_eq!(
+        optional_value_tool_values(&["tool", "run", "--color", "n"]),
+        ["never"]
+    );
+}
+
+#[test]
+fn optional_value_equals_form_keeps_prefix() {
+    // `--color=` completes the same values but keeps the attached `--color=`
+    // prefix on every candidate.
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color="]),
+        ["--color=auto", "--color=always", "--color=never"]
+    );
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color=a"]),
+        ["--color=auto", "--color=always"]
+    );
+    assert_eq!(
+        optional_value_tool_values(&["tool", "run", "--color="]),
+        ["--color=auto", "--color=always", "--color=never"]
+    );
+    assert_eq!(
+        optional_value_tool_values(&["tool", "run", "--color=n"]),
+        ["--color=never"]
+    );
+}
+
+#[test]
+fn optional_value_flag_like_word_switches_option() {
+    // `--mode` cannot be a color value, so the pending `--color` is treated
+    // as not providing a value and `--mode` starts a new option whose values
+    // are completed instead.
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color", "--mode", ""]),
+        ["fast", "slow"]
+    );
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color=always", "--mode", ""]),
+        ["fast", "slow"]
+    );
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color", "--mode=f"]),
+        ["--mode=fast"]
+    );
+
+    // A flag-like prefix offers the matching option, not color values.
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color", "--m"]),
+        ["--mode"]
+    );
+    assert_eq!(
+        optional_value_tool_values(&["tool", "run", "--color", "--c"]),
+        ["--color"]
+    );
+}
+
+#[test]
+fn optional_value_repeatable_after_complete_value() {
+    // Once a color value is complete, `--color` may occur again and the later
+    // occurrence takes a value of its own.
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color", "always", "--color", ""]),
+        ["auto", "always", "never"]
+    );
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color=auto", "--color", "n"]),
+        ["never"]
+    );
+    // A pending `--color` followed by another `--color` leaves the first one
+    // valueless; the second one is completed.
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color", "--color", ""]),
+        ["auto", "always", "never"]
+    );
+
+    // After a complete color, `--color` is still offered (repeatable) while
+    // the conflicting `--quiet` is filtered out.
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color", "always", ""]),
+        ["run", "src-a", "src-b", "--color", "--mode"]
+    );
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color=always", ""]),
+        ["run", "src-a", "src-b", "--color", "--mode"]
+    );
+}
+
+#[test]
+fn optional_value_terminator_stays_in_positionals() {
+    // `--` cancels the pending optional color value and permanently switches
+    // to positional input at the current level.
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color", "--", ""]),
+        ["src-a", "src-b"]
+    );
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color=always", "--", ""]),
+        ["src-a", "src-b"]
+    );
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color", "--", "s"]),
+        ["src-a", "src-b"]
+    );
+    // Later words keep filling the current level's positionals.
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color", "--", "src-a", ""]),
+        ["dst-a", "dst-b"]
+    );
+
+    // Inside `run` the terminator stays at the `run` level: its positionals
+    // are offered, never the root positionals or root options.
+    assert_eq!(
+        optional_value_tool_values(&["tool", "run", "--color", "--", ""]),
+        ["job-a", "job-b"]
+    );
+    assert_eq!(
+        optional_value_tool_values(&["tool", "run", "--color", "--", "job-a", ""]),
+        ["log-a", "log-b"]
+    );
+}
+
+#[test]
+fn optional_value_after_terminator_boundary_words_are_empty() {
+    // After `--`, option-style words, the subcommand name, another `--`, and
+    // unknown words are positional values: they never re-enter option parsing,
+    // never descend into `run`, and succeed with no candidates.
+    for word in ["--color", "--mode", "--", "-x", "run", "bogus"] {
+        assert!(
+            optional_value_tool_values(&["tool", "--color", "--", word]).is_empty(),
+            "unexpected candidates for {word:?}"
+        );
+        assert!(
+            optional_value_tool_values(&["tool", "run", "--color", "--", word]).is_empty(),
+            "unexpected candidates for {word:?}"
+        );
+    }
+
+    // `run` after `--` is a positional value, not a subcommand: parsing must
+    // not descend, so the next word completes the root `dst` positional.
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color", "--", "run", ""]),
+        ["dst-a", "dst-b"]
+    );
+
+    // Positional slots are exhausted; completion succeeds with no candidates
+    // rather than erroring or falling back to another level.
+    assert!(optional_value_tool_values(&["tool", "--color", "--", "src-a", "dst-a", ""]).is_empty());
+    assert!(
+        optional_value_tool_values(&["tool", "run", "--color", "--", "job-a", "log-a", ""])
+            .is_empty()
+    );
+}
+
+#[test]
+fn optional_value_invalid_prior_words_still_complete() {
+    // A conflicting pair already on the command line must not make completion
+    // fail or drop the pending option's values.
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--quiet", "--color", ""]),
+        ["auto", "always", "never"]
+    );
+    // The conflict only filters by the occurred relation: `--color` is gone
+    // once `--quiet` was used, everything else stays.
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--quiet", ""]),
+        ["run", "src-a", "src-b", "--mode", "--quiet"]
+    );
+
+    // An invalid color value is still consumed as the color value; completion
+    // continues without erroring or clearing unrelated candidates.
+    let after_invalid: &[&str] = &["run", "src-a", "src-b", "--color", "--mode"];
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color", "bogus", ""]),
+        after_invalid
+    );
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color=bogus", ""]),
+        after_invalid
+    );
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color", "bogus", "--mode", ""]),
+        ["fast", "slow"]
+    );
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color", "bogus", "--", ""]),
+        ["src-a", "src-b"]
+    );
+
+    // A value beyond the option's range becomes a positional; an invalid
+    // positional value must not break later completion either.
+    assert_eq!(
+        optional_value_tool_values(&["tool", "--color", "auto", "never", ""]),
+        ["run", "dst-a", "dst-b", "--color", "--mode"]
+    );
+    // Out-of-range positionals leave no positional candidates but must not
+    // error or suppress options and subcommands.
+    assert_eq!(
+        optional_value_tool_values(&["tool", "src-a", "dst-a", "extra", ""]),
+        ["run", "--color", "--mode", "--quiet"]
+    );
+
+    // A prefix with no match is a successful empty result.
+    assert!(optional_value_tool_values(&["tool", "--color", "zzz"]).is_empty());
+    assert!(optional_value_tool_values(&["tool", "--color=zzz"]).is_empty());
+    assert!(optional_value_tool_values(&["tool", "--zzz"]).is_empty());
+}
+
+#[test]
+fn optional_value_metadata_matches_across_forms_and_levels() {
+    // The retained candidates must carry identical text, help, id, tag,
+    // order, and hidden state regardless of space- or equals-separated input,
+    // at both the root and the subcommand level.
+    let cases: &[(&[&str], &[&str])] = &[
+        (
+            &["tool", "--color", "always", ""],
+            &["tool", "--color=always", ""],
+        ),
+        (
+            &["tool", "--color", "always", "--mode", ""],
+            &["tool", "--color=always", "--mode", ""],
+        ),
+        (
+            &["tool", "--color", ""],
+            &["tool", "run", "--color", ""],
+        ),
+        (
+            &["tool", "--color", "--", ""],
+            &["tool", "--color=always", "--", ""],
+        ),
+    ];
+    for (spaced, attached) in cases {
+        assert_eq!(
+            candidate_metadata(complete_optional_value_tool(spaced)),
+            candidate_metadata(complete_optional_value_tool(attached)),
+            "{spaced:?} vs {attached:?}"
+        );
+    }
+}
+
 fn complete(cmd: &mut Command, args: impl AsRef<str>, current_dir: Option<&Path>) -> String {
     let input = args.as_ref();
     let mut args = vec![std::ffi::OsString::from(cmd.get_name())];
