@@ -1553,7 +1553,7 @@ fn conflicting_long_options_are_filtered() {
     // Baseline: no conflicts in play, grouping and order are untouched.
     assert_eq!(
         complete_tool(&["tool", ""]),
-        ["--json", "--toml", "--verbose", "--quiet"]
+        ["--json", "--j", "--toml", "--verbose", "--quiet"]
     );
 
     // `--json` conflicts with `--toml`; unrelated candidates remain.
@@ -1561,7 +1561,10 @@ fn conflicting_long_options_are_filtered() {
     assert!(completions.contains(&"--verbose".to_owned()));
     assert!(completions.contains(&"--quiet".to_owned()));
     assert!(!completions.contains(&"--toml".to_owned()));
-    assert_eq!(completions, ["--json", "--verbose", "--quiet"]);
+    assert_eq!(
+        completions,
+        ["--json", "--j", "--verbose", "--quiet"]
+    );
 }
 
 #[test]
@@ -1581,7 +1584,10 @@ fn conflict_filter_with_repeated_flag() {
     assert!(completions.contains(&"--verbose".to_owned()));
     assert!(completions.contains(&"--quiet".to_owned()));
     assert!(!completions.contains(&"--toml".to_owned()));
-    assert_eq!(completions, ["--json", "--verbose", "--quiet"]);
+    assert_eq!(
+        completions,
+        ["--json", "--j", "--verbose", "--quiet"]
+    );
 }
 
 #[test]
@@ -1602,7 +1608,7 @@ fn conflicting_prior_args_do_not_fail_completion() {
     let completions = complete_tool(&["tool", "--verbose", "--quiet", ""]);
     assert!(completions.contains(&"--json".to_owned()));
     assert!(completions.contains(&"--toml".to_owned()));
-    assert_eq!(completions, ["--json", "--toml"]);
+    assert_eq!(completions, ["--json", "--j", "--toml"]);
 }
 
 #[test]
@@ -2147,7 +2153,9 @@ pos-a
 pos-b
 pos-c
 --required-flag
+--required-flag2
 --optional-flag
+--2optional-flag
 --long-flag
 -s
 --help	Print help

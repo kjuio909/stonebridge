@@ -87,13 +87,18 @@ pub fn complete(
                 let opt = current_cmd.get_arguments().find(|a| is_long_match(a, flag));
 
                 if let Some(opt) = opt {
-                    used_args.push(opt.get_id().clone());
+                    record_used_arg(&mut used_args, opt.get_id());
                     if opt.get_num_args().expect("built").takes_values() {
                         // An attached value (`--opt=value`) counts toward the
                         // option's values just like a space-separated one, so
                         // that completing after `--opt=value` sees the same
                         // state as completing after `--opt value`.
-                        let count = value.map(|v| attached_value_count(opt, v)).unwrap_or(0);
+                        // An empty attached value (`--opt=`) types no value
+                        // yet, so the option stays pending.
+                        let count = value
+                            .filter(|v| !v.is_empty())
+                            .map(|v| attached_value_count(opt, v))
+                            .unwrap_or(0);
                         next_state = parse_opt_value(opt, count);
                     };
                 } else if pos_allows_hyphen(current_cmd, pos_index) {
@@ -104,16 +109,19 @@ pub fn complete(
         } else if let Some(short) = arg.to_short() {
             let (_, matched_opts, takes_value_opt, mut short) =
                 parse_shortflags(current_cmd, short);
-            used_args.extend(matched_opts.iter().map(|opt| opt.get_id().clone()));
+            for opt in &matched_opts {
+                record_used_arg(&mut used_args, opt.get_id());
+            }
             if let Some(opt) = takes_value_opt {
                 // An attached value (`-ovalue`, `-o=value`) counts toward the
-                // option's values just like a space-separated one.
+                // option's values just like a space-separated one. An empty
+                // attached value (`-o=`) types no value yet, so the option
+                // stays pending instead of being treated as satisfied.
                 let count = short
                     .next_value_os()
-                    .map(|v| {
-                        let v = v.strip_prefix("=").unwrap_or(v);
-                        attached_value_count(opt, v)
-                    })
+                    .map(|v| v.strip_prefix("=").unwrap_or(v))
+                    .filter(|v| !v.is_empty())
+                    .map(|v| attached_value_count(opt, v))
                     .unwrap_or(0);
                 next_state = parse_opt_value(opt, count);
             } else if pos_allows_hyphen(current_cmd, pos_index) {
@@ -232,18 +240,11 @@ fn complete_arg(
             }
         }
     }
-    filter_conflicting_candidates(&mut completions, cmd, used_args);
+    filter_unavailable_args(&mut completions, cmd, used_args);
     if completions.iter().any(|a| !a.is_hide_set()) {
         completions.retain(|a| !a.is_hide_set());
     }
-    let mut seen_ids = std::collections::HashSet::new();
-    completions.retain(move |a| {
-        if let Some(id) = a.get_id().cloned() {
-            seen_ids.insert(id)
-        } else {
-            true
-        }
-    });
+    dedup_argument_candidates(&mut completions, arg.is_empty());
 
     let mut tags = Vec::new();
     for candidate in &completions {
@@ -694,14 +695,19 @@ fn is_short_match(arg: &clap::Arg, flag: char) -> bool {
             .is_some_and(|aliases| aliases.contains(&flag))
 }
 
-/// Remove candidates for arguments that conflict with arguments already
-/// present on the command line.
+/// Remove argument candidates that are unavailable given the arguments
+/// already present on the command line.
 ///
-/// Conflicts only need to be declared on one of the two arguments; a
-/// candidate is removed when either it or an already-used argument names
-/// the other as a conflict. Anything that is not an argument candidate
-/// (positional values, subcommands, custom candidates) is left untouched.
-fn filter_conflicting_candidates(
+/// Two rules apply:
+/// - Non-multiple argument groups: once any member of such a group is on the
+///   command line, every member of that group (including the selected one and
+///   all of its aliases) is removed, mirroring the parser's one-of constraint.
+/// - Explicit conflicts: a candidate that conflicts with an already-used
+///   argument is removed; conflicts only need to be declared on one side.
+///
+/// Anything that is not an argument candidate (positional values,
+/// subcommands, custom candidates) is left untouched.
+fn filter_unavailable_args(
     completions: &mut Vec<CompletionCandidate>,
     cmd: &clap::Command,
     used_args: &[clap::Id],
@@ -709,6 +715,19 @@ fn filter_conflicting_candidates(
     if used_args.is_empty() {
         return;
     }
+
+    // Members of non-multiple groups that already have a member present.
+    let mut excluded_by_group = std::collections::HashSet::<clap::Id>::new();
+    for group in cmd.get_groups().filter(|group| !group.is_multiple_set()) {
+        let members: Vec<&clap::Id> = group.get_args().collect();
+        if members
+            .iter()
+            .any(|id| used_args.iter().any(|used| used == *id))
+        {
+            excluded_by_group.extend(members.into_iter().cloned());
+        }
+    }
+
     completions.retain(|candidate| {
         let Some(arg) = candidate
             .get_id()
@@ -717,12 +736,67 @@ fn filter_conflicting_candidates(
         else {
             return true;
         };
+        if excluded_by_group.contains(arg.get_id()) {
+            return false;
+        }
         !used_args.iter().any(|used_id| {
             cmd.get_arguments()
                 .find(|a| a.get_id() == used_id)
                 .is_some_and(|used| args_conflict(cmd, arg, used))
         })
     });
+}
+
+/// Record an argument seen on the command line, keeping the first occurrence
+/// only so that repeating a flag neither alters filtering nor restores
+/// candidates already excluded.
+fn record_used_arg(used_args: &mut Vec<clap::Id>, id: &clap::Id) {
+    if !used_args.iter().any(|used| used == id) {
+        used_args.push(id.clone());
+    }
+}
+
+/// De-duplicate flag candidates.
+///
+/// With an empty word every long spelling of an argument (its long name and
+/// visible aliases) is offered, while short spellings are still collapsed to
+/// the canonical short and dropped for arguments that also have a long form.
+/// Once a prefix is typed at most one spelling of an argument can match, so
+/// candidates are de-duplicated by argument id as before.
+fn dedup_argument_candidates(completions: &mut Vec<CompletionCandidate>, empty_word: bool) {
+    if empty_word {
+        let long_ids: std::collections::HashSet<String> = completions
+            .iter()
+            .filter(|candidate| {
+                candidate.get_id().is_some() && candidate.get_value().starts_with("--")
+            })
+            .filter_map(|candidate| candidate.get_id().cloned())
+            .collect();
+        let mut seen_short_ids = std::collections::HashSet::new();
+        completions.retain(|candidate| {
+            let Some(id) = candidate.get_id() else {
+                return true;
+            };
+            if candidate.get_value().starts_with("--") {
+                // Keep the long name and every visible alias.
+                true
+            } else if long_ids.contains(id) {
+                // Prefer the long forms over the short ones.
+                false
+            } else {
+                seen_short_ids.insert(id.clone())
+            }
+        });
+    } else {
+        let mut seen_ids = std::collections::HashSet::new();
+        completions.retain(|candidate| {
+            if let Some(id) = candidate.get_id().cloned() {
+                seen_ids.insert(id)
+            } else {
+                true
+            }
+        });
+    }
 }
 
 /// Whether `first` and `second` conflict, no matter which one declares it.

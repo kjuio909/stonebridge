@@ -526,6 +526,12 @@ impl ArgGroup {
     pub fn is_required_set(&self) -> bool {
         self.required
     }
+
+    /// Reports whether [`ArgGroup::multiple`] is set
+    #[inline]
+    pub fn is_multiple_set(&self) -> bool {
+        self.multiple
+    }
 }
 
 impl From<&'_ Self> for ArgGroup {
