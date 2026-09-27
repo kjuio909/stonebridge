@@ -77,6 +77,18 @@ pub fn complete(
                 parse_positional(current_cmd, pos_index, is_escaped, current_state);
         } else if arg.is_escape() {
             is_escaped = true;
+            // Mirror the parser: once `--` is seen and any positional is
+            // `.last(true)`, every remaining value goes to the last
+            // positional, so jump straight to it.
+            if current_cmd.get_positionals().any(|p| p.is_last_set()) {
+                if let Some(last_index) = current_cmd
+                    .get_positionals()
+                    .filter_map(|p| p.get_index())
+                    .max()
+                {
+                    pos_index = last_index;
+                }
+            }
         } else if opt_allows_hyphen(&current_state, &arg) {
             match current_state {
                 ParseState::Opt((opt, count)) => next_state = parse_opt_value(opt, count),
@@ -184,6 +196,7 @@ fn complete_arg(
             if let Some(positional) = cmd
                 .get_positionals()
                 .find(|p| p.get_index() == Some(pos_index))
+                .filter(|p| is_escaped || !p.is_last_set())
             {
                 completions.extend(complete_arg_value(
                     arg.to_value(),
@@ -200,6 +213,7 @@ fn complete_arg(
             if let Some(positional) = cmd
                 .get_positionals()
                 .find(|p| p.get_index() == Some(pos_index))
+                .filter(|p| is_escaped || !p.is_last_set())
             {
                 completions.extend(complete_arg_value(
                     arg.to_value(),
