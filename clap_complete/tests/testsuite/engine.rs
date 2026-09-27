@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::Path;
 
-use clap::{builder::PossibleValue, Command};
+use clap::{builder::PossibleValue, ArgGroup, Command};
 use clap_complete::engine::{
     ArgValueCandidates, ArgValueCompleter, CompletionCandidate, PathCompleter, SubcommandCandidates,
 };
@@ -165,9 +165,22 @@ fn suggest_hidden_long_flag_aliases() {
                 .hide(true),
         );
 
-    assert_data_eq!(complete!(cmd, "--test"), snapbox::str!["--test_visible"]);
+    assert_data_eq!(
+        complete!(cmd, "--test"),
+        snapbox::str![[r#"
+--test_visible
+--test_visible-alias_visible
+"#]]
+    );
 
-    assert_data_eq!(complete!(cmd, "--test_h"), snapbox::str!["--test_hidden"]);
+    assert_data_eq!(
+        complete!(cmd, "--test_h"),
+        snapbox::str![[r#"
+--test_hidden
+--test_hidden-alias_visible
+--test_hidden-alias_hidden
+"#]]
+    );
 
     assert_data_eq!(
         complete!(cmd, "--test_visible-alias_h"),
@@ -1553,7 +1566,7 @@ fn conflicting_long_options_are_filtered() {
     // Baseline: no conflicts in play, grouping and order are untouched.
     assert_eq!(
         complete_tool(&["tool", ""]),
-        ["--json", "--toml", "--verbose", "--quiet"]
+        ["--json", "--j", "--toml", "--verbose", "--quiet"]
     );
 
     // `--json` conflicts with `--toml`; unrelated candidates remain.
@@ -1561,7 +1574,7 @@ fn conflicting_long_options_are_filtered() {
     assert!(completions.contains(&"--verbose".to_owned()));
     assert!(completions.contains(&"--quiet".to_owned()));
     assert!(!completions.contains(&"--toml".to_owned()));
-    assert_eq!(completions, ["--json", "--verbose", "--quiet"]);
+    assert_eq!(completions, ["--json", "--j", "--verbose", "--quiet"]);
 }
 
 #[test]
@@ -1581,7 +1594,7 @@ fn conflict_filter_with_repeated_flag() {
     assert!(completions.contains(&"--verbose".to_owned()));
     assert!(completions.contains(&"--quiet".to_owned()));
     assert!(!completions.contains(&"--toml".to_owned()));
-    assert_eq!(completions, ["--json", "--verbose", "--quiet"]);
+    assert_eq!(completions, ["--json", "--j", "--verbose", "--quiet"]);
 }
 
 #[test]
@@ -1602,7 +1615,7 @@ fn conflicting_prior_args_do_not_fail_completion() {
     let completions = complete_tool(&["tool", "--verbose", "--quiet", ""]);
     assert!(completions.contains(&"--json".to_owned()));
     assert!(completions.contains(&"--toml".to_owned()));
-    assert_eq!(completions, ["--json", "--toml"]);
+    assert_eq!(completions, ["--json", "--j", "--toml"]);
 }
 
 #[test]
@@ -1623,6 +1636,335 @@ fn hidden_alias_shares_conflicts() {
     assert!(completions.contains(&"--quiet".to_owned()));
     assert!(!completions.contains(&"--json".to_owned()));
     assert_eq!(completions, ["--verbose", "--quiet"]);
+}
+
+/// Build the `tool` command used to verify dynamic completion of a required,
+/// non-multiple argument group.
+///
+/// Root:
+/// - a required, exclusive `format` group of the value-less `--json`/`--yaml`
+///   flags, with visible aliases `--js`/`--yml`
+/// - `--output`, restricted to `file`/`stream`
+/// - the `run` subcommand
+///
+/// `run` has its own required, exclusive `mode` group (`--text`/`--binary`)
+/// and a positional with the values `job`/`log`.
+fn exclusive_group_cmd() -> Command {
+    Command::new("tool")
+        .disable_help_flag(true)
+        .disable_version_flag(true)
+        .disable_help_subcommand(true)
+        .arg(
+            clap::Arg::new("json")
+                .long("json")
+                .visible_alias("js")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            clap::Arg::new("yaml")
+                .long("yaml")
+                .visible_alias("yml")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            clap::Arg::new("output")
+                .long("output")
+                .value_parser(["file", "stream"]),
+        )
+        .group(
+            ArgGroup::new("format")
+                .args(["json", "yaml"])
+                .required(true)
+                .multiple(false),
+        )
+        .subcommand(
+            Command::new("run")
+                .disable_help_flag(true)
+                .disable_version_flag(true)
+                .disable_help_subcommand(true)
+                .arg(
+                    clap::Arg::new("text")
+                        .long("text")
+                        .action(clap::ArgAction::SetTrue),
+                )
+                .arg(
+                    clap::Arg::new("binary")
+                        .long("binary")
+                        .action(clap::ArgAction::SetTrue),
+                )
+                .arg(clap::Arg::new("kind").value_parser(["job", "log"]))
+                .group(
+                    ArgGroup::new("mode")
+                        .args(["text", "binary"])
+                        .required(true)
+                        .multiple(false),
+                ),
+        )
+}
+
+fn complete_exclusive_group(cmd: &mut Command, args: &[&str]) -> Vec<CompletionCandidate> {
+    let args: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
+    let arg_index = args.len() - 1;
+    clap_complete::engine::complete(cmd, args, arg_index, None).unwrap()
+}
+
+fn exclusive_group_values(cmd: &mut Command, args: &[&str]) -> Vec<String> {
+    complete_exclusive_group(cmd, args)
+        .into_iter()
+        .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+        .collect()
+}
+
+#[test]
+fn exclusive_group_empty_lists_members_aliases_and_unrelated() {
+    // Before a choice is made the empty word offers both members' primary
+    // names and visible aliases (four entries), plus the unrelated `--output`
+    // option and the `run` subcommand.
+    let mut cmd = exclusive_group_cmd();
+    assert_eq!(
+        exclusive_group_values(&mut cmd, &["tool", ""]),
+        ["run", "--json", "--js", "--yaml", "--yml", "--output"]
+    );
+}
+
+#[test]
+fn exclusive_group_choice_hides_the_whole_group() {
+    // After any member (or its visible alias) is chosen, every primary name
+    // and alias of the same group disappears, while unrelated candidates and
+    // the subcommand stay available.
+    for chosen in ["--json", "--js", "--yaml", "--yml"] {
+        let mut cmd = exclusive_group_cmd();
+        assert_eq!(
+            exclusive_group_values(&mut cmd, &["tool", chosen, ""]),
+            ["run", "--output"],
+            "choice {chosen}"
+        );
+    }
+}
+
+#[test]
+fn exclusive_group_repeated_choice_still_succeeds() {
+    // Repeating the selected member (under either spelling) must succeed,
+    // must not bring back any group candidate, and must not error.
+    for prior in [
+        &["tool", "--json", "--json", ""][..],
+        &["tool", "--json", "--js", ""][..],
+        &["tool", "--js", "--json", ""][..],
+        &["tool", "--yaml", "--yml", ""][..],
+    ] {
+        let mut cmd = exclusive_group_cmd();
+        assert_eq!(exclusive_group_values(&mut cmd, prior), ["run", "--output"]);
+    }
+}
+
+#[test]
+fn exclusive_group_prefix_only_offers_members() {
+    // A member prefix before any choice narrows the group down to matching
+    // spellings; unrelated options are not offered for that prefix.
+    let mut cmd = exclusive_group_cmd();
+    assert_eq!(
+        exclusive_group_values(&mut cmd, &["tool", "--j"]),
+        ["--json", "--js"]
+    );
+
+    // Once a choice is made a prefix that only matched the chosen group is
+    // an empty success instead of restoring a group candidate.
+    let mut cmd = exclusive_group_cmd();
+    assert!(exclusive_group_values(&mut cmd, &["tool", "--json", "--y"]).is_empty());
+    let mut cmd = exclusive_group_cmd();
+    assert!(exclusive_group_values(&mut cmd, &["tool", "--yaml", "--j"]).is_empty());
+}
+
+#[test]
+fn exclusive_group_output_values_are_completed() {
+    // The value-taking `--output` option is independent of the format group.
+    let mut cmd = exclusive_group_cmd();
+    assert_eq!(
+        exclusive_group_values(&mut cmd, &["tool", "--output", ""]),
+        ["file", "stream"]
+    );
+
+    let mut cmd = exclusive_group_cmd();
+    assert_eq!(
+        exclusive_group_values(&mut cmd, &["tool", "--output", "f"]),
+        ["file"]
+    );
+
+    // `--output=` followed by a separate word is the same pending-value
+    // state as `--output`, and prefix filtering still applies.
+    let mut cmd = exclusive_group_cmd();
+    assert_eq!(
+        exclusive_group_values(&mut cmd, &["tool", "--output=", "s"]),
+        ["stream"]
+    );
+}
+
+#[test]
+fn exclusive_group_invalid_output_value_does_not_pollute() {
+    // An illegal attached value must not error and must not leave `--output`
+    // in a stuck state: the following empty word offers the normal root set.
+    let mut cmd = exclusive_group_cmd();
+    assert_eq!(
+        exclusive_group_values(&mut cmd, &["tool", "--output=pipe", ""]),
+        ["run", "--json", "--js", "--yaml", "--yml", "--output"]
+    );
+
+    // A later completion on the same command object is unaffected.
+    assert_eq!(
+        exclusive_group_values(&mut cmd, &["tool", "--output", ""]),
+        ["file", "stream"]
+    );
+}
+
+#[test]
+fn exclusive_group_does_not_leak_into_subcommand() {
+    // Inside `run` only the run-level group members and positional values are
+    // offered; the root group and root options never leak down.
+    let mut cmd = exclusive_group_cmd();
+    let values = exclusive_group_values(&mut cmd, &["tool", "run", ""]);
+    assert_eq!(values, ["job", "log", "--text", "--binary"]);
+    for leaked in ["--json", "--js", "--yaml", "--yml", "--output"] {
+        assert!(!values.contains(&leaked.to_owned()), "`{leaked}` leaked into run");
+    }
+}
+
+#[test]
+fn exclusive_group_subcommand_choice_hides_its_own_group() {
+    // The run-level group behaves like the root group: choosing a member
+    // leaves only the positional values.
+    for chosen in ["--text", "--binary"] {
+        let mut cmd = exclusive_group_cmd();
+        assert_eq!(
+            exclusive_group_values(&mut cmd, &["tool", "run", chosen, ""]),
+            ["job", "log"],
+            "choice {chosen}"
+        );
+    }
+
+    // Repeating the choice is fine too.
+    let mut cmd = exclusive_group_cmd();
+    assert_eq!(
+        exclusive_group_values(&mut cmd, &["tool", "run", "--text", "--text", ""]),
+        ["job", "log"]
+    );
+}
+
+#[test]
+fn exclusive_group_subcommand_positional_prefixes() {
+    let mut cmd = exclusive_group_cmd();
+    assert_eq!(
+        exclusive_group_values(&mut cmd, &["tool", "run", "j"]),
+        ["job"]
+    );
+
+    let mut cmd = exclusive_group_cmd();
+    assert!(exclusive_group_values(&mut cmd, &["tool", "run", "x"]).is_empty());
+
+    // After a member choice, the positional prefixes still complete while the
+    // group stays hidden.
+    let mut cmd = exclusive_group_cmd();
+    assert_eq!(
+        exclusive_group_values(&mut cmd, &["tool", "run", "--binary", "l"]),
+        ["log"]
+    );
+}
+
+#[test]
+fn exclusive_group_aliases_and_invalid_prefixes_are_empty_successes() {
+    // Unknown options and no-match prefixes complete successfully with an
+    // empty set rather than erroring.
+    for args in [
+        &["tool", "--bogus"][..],
+        &["tool", "--json", "--bogus"][..],
+        &["tool", "run", "--bogus"][..],
+        &["tool", "zzzzz"][..],
+        &["tool", "run", "zzzzz"][..],
+    ] {
+        let mut cmd = exclusive_group_cmd();
+        assert!(
+            exclusive_group_values(&mut cmd, args).is_empty(),
+            "args {args:?} should be empty"
+        );
+    }
+}
+
+#[test]
+fn exclusive_group_state_is_not_polluted_across_calls() {
+    // Every call shares the same command object; choices and invalid input in
+    // one call must not affect the candidates of later calls.
+    let mut cmd = exclusive_group_cmd();
+
+    // A choice filters the group for that call only.
+    assert_eq!(
+        exclusive_group_values(&mut cmd, &["tool", "--json", ""]),
+        ["run", "--output"]
+    );
+    assert_eq!(
+        exclusive_group_values(&mut cmd, &["tool", ""]),
+        ["run", "--json", "--js", "--yaml", "--yml", "--output"]
+    );
+
+    // Failed/illegal input leaves the command usable.
+    assert!(exclusive_group_values(&mut cmd, &["tool", "--json", "--yaml", "--zzz"]).is_empty());
+    assert!(exclusive_group_values(&mut cmd, &["tool", "--output=pipe", "f"]).is_empty());
+    assert_eq!(
+        exclusive_group_values(&mut cmd, &["tool", "--yaml", ""]),
+        ["run", "--output"]
+    );
+    assert_eq!(
+        exclusive_group_values(&mut cmd, &["tool", "run", "--text", ""]),
+        ["job", "log"]
+    );
+    // A root completion after a run completion is independent.
+    assert_eq!(
+        exclusive_group_values(&mut cmd, &["tool", ""]),
+        ["run", "--json", "--js", "--yaml", "--yml", "--output"]
+    );
+}
+
+#[test]
+fn exclusive_group_preserves_order_and_metadata_of_unfiltered() {
+    // Candidates not removed by the group filter keep their relative order and
+    // full metadata (value, help, id, tag, display order, hidden state).
+    type CandidateMetadata = (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<usize>,
+        bool,
+    );
+    fn metadata(candidates: Vec<CompletionCandidate>) -> Vec<CandidateMetadata> {
+        candidates
+            .into_iter()
+            .map(|candidate| {
+                (
+                    candidate.get_value().to_string_lossy().into_owned(),
+                    candidate.get_help().map(|help| help.to_string()),
+                    candidate.get_id().cloned(),
+                    candidate.get_tag().map(|tag| tag.to_string()),
+                    candidate.get_display_order(),
+                    candidate.is_hide_set(),
+                )
+            })
+            .collect()
+    }
+
+    let mut baseline_cmd = exclusive_group_cmd();
+    let baseline = metadata(complete_exclusive_group(&mut baseline_cmd, &["tool", ""]));
+    let expected: Vec<_> = baseline
+        .into_iter()
+        .filter(|candidate| candidate.0 == "run" || candidate.0 == "--output")
+        .collect();
+
+    for chosen in ["--json", "--js", "--yaml", "--yml"] {
+        let mut cmd = exclusive_group_cmd();
+        assert_eq!(
+            metadata(complete_exclusive_group(&mut cmd, &["tool", chosen, ""])),
+            expected,
+            "choice {chosen}"
+        );
+    }
 }
 
 fn terminator_tool_cmd() -> Command {
@@ -2147,7 +2489,9 @@ pos-a
 pos-b
 pos-c
 --required-flag
+--required-flag2
 --optional-flag
+--2optional-flag
 --long-flag
 -s
 --help	Print help
@@ -2167,7 +2511,9 @@ pos-c
         complete!(cmd, "--[TAB]"),
         snapbox::str![[r#"
 --required-flag
+--required-flag2
 --optional-flag
+--2optional-flag
 --long-flag
 --help	Print help
 "#]]

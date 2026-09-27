@@ -233,15 +233,28 @@ fn complete_arg(
         }
     }
     filter_conflicting_candidates(&mut completions, cmd, used_args);
+    filter_exclusive_group_candidates(&mut completions, cmd, used_args);
     if completions.iter().any(|a| !a.is_hide_set()) {
         completions.retain(|a| !a.is_hide_set());
     }
-    let mut seen_ids = std::collections::HashSet::new();
-    completions.retain(move |a| {
-        if let Some(id) = a.get_id().cloned() {
-            seen_ids.insert(id)
+    // Collapse the several spellings of an argument the way they are shown:
+    // every long spelling (the primary name and each visible alias) is its own
+    // candidate, while the short spellings share one slot with the long
+    // spellings. Whichever style is generated first wins the shared slot (e.g.
+    // at `-` the short spelling comes first), preserving the established
+    // presentation.
+    let mut long_seen = std::collections::HashSet::<(String, OsString)>::new();
+    let mut short_taken = std::collections::HashSet::<String>::new();
+    let mut long_taken = std::collections::HashSet::<String>::new();
+    completions.retain(|a| {
+        let Some(id) = a.get_id() else {
+            return true;
+        };
+        if a.get_value().starts_with("--") {
+            long_taken.insert(id.clone());
+            !short_taken.contains(id) && long_seen.insert((id.clone(), a.get_value().to_owned()))
         } else {
-            true
+            !long_taken.contains(id) && short_taken.insert(id.clone())
         }
     });
 
@@ -736,6 +749,47 @@ fn args_conflict(cmd: &clap::Command, first: &clap::Arg, second: &clap::Arg) -> 
             .any(|c| c.get_id() == first.get_id())
 }
 
+/// Remove candidates for every member of a non-multiple argument group once
+/// one of its members is already present.
+///
+/// Only groups that disallow more than one member (`ArgGroup::multiple(false)`,
+/// the default) are treated as exclusive, mirroring how the parser validates
+/// them. Once a choice from such a group has been made, none of that group's
+/// members (the selected one included, with all of their names and aliases)
+/// are offered anymore; repeating the selected member on the command line is
+/// still accepted. Positional values, subcommands, and custom candidates are
+/// left untouched, as are candidates belonging to other groups.
+fn filter_exclusive_group_candidates(
+    completions: &mut Vec<CompletionCandidate>,
+    cmd: &clap::Command,
+    used_args: &[clap::Id],
+) {
+    if used_args.is_empty() {
+        return;
+    }
+    // Ids of every member of each exclusive group that already has a member
+    // on the command line.
+    let mut excluded: std::collections::HashSet<clap::Id> = std::collections::HashSet::new();
+    for group in cmd.get_groups() {
+        if group.is_multiple() {
+            continue;
+        }
+        let mut members = group.get_args();
+        if members.any(|id| used_args.contains(id)) {
+            excluded.extend(group.get_args().cloned());
+        }
+    }
+    if excluded.is_empty() {
+        return;
+    }
+    completions.retain(|candidate| {
+        let Some(arg_id) = candidate.get_id().and_then(|id| id.strip_prefix("arg::")) else {
+            return true;
+        };
+        !excluded.iter().any(|id| id.as_str() == arg_id)
+    });
+}
+
 /// Parse the positional arguments. Return the new state and the new positional index.
 fn parse_positional<'a>(
     cmd: &clap::Command,
@@ -801,9 +855,15 @@ fn parse_opt_value(opt: &clap::Arg, count: usize) -> ParseState<'_> {
 /// How many of an option's values an attached `=value` (or `-ovalue`) accounts
 /// for, honoring the value delimiter.
 fn attached_value_count(opt: &clap::Arg, value: &OsStr) -> usize {
-    match (opt.get_value_delimiter(), value.to_str()) {
-        (Some(delimiter), Some(value)) => value.split(delimiter).count(),
-        _ => 1,
+    if value.is_empty() {
+        // `--opt=` (or `-o=`) leaves the value untyped, so the option is still
+        // waiting on its first value; the next word is completed as that value.
+        0
+    } else {
+        match (opt.get_value_delimiter(), value.to_str()) {
+            (Some(delimiter), Some(value)) => value.split(delimiter).count(),
+            _ => 1,
+        }
     }
 }
 
