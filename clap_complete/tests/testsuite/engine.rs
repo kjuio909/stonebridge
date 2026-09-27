@@ -73,9 +73,21 @@ fn suggest_hidden_subcommand_and_aliases() {
                 .hide(true),
         );
 
-    assert_data_eq!(complete!(cmd, "test"), snapbox::str!["test_visible"]);
+    assert_data_eq!(
+        complete!(cmd, "test"),
+        snapbox::str![[r#"
+test_visible
+test_visible-alias_visible
+"#]]
+    );
 
-    assert_data_eq!(complete!(cmd, "test_h"), snapbox::str!["test_hidden"]);
+    assert_data_eq!(
+        complete!(cmd, "test_h"),
+        snapbox::str![[r#"
+test_hidden
+test_hidden-alias_visible
+"#]]
+    );
 
     assert_data_eq!(
         complete!(cmd, "test_hidden-alias_h"),
@@ -106,7 +118,9 @@ fn suggest_subcommand_aliases() {
         complete!(cmd, "hello"),
         snapbox::str![[r#"
 hello-world
+hello-world-foo
 hello-moon
+hello-moon-foo
 "#]],
     );
 }
@@ -2789,6 +2803,286 @@ fn nested_color_preserves_candidate_metadata() {
         .cloned()
         .collect();
     assert_eq!(escaped, expected);
+}
+
+fn subcommand_alias_tool_cmd() -> Command {
+    Command::new("tool")
+        .disable_help_flag(true)
+        .disable_version_flag(true)
+        .disable_help_subcommand(true)
+        .arg(clap::Arg::new("root-pos").value_parser(["config", "status"]))
+        .subcommand(
+            Command::new("run")
+                .visible_alias("r")
+                .alias("legacy-run")
+                .disable_help_flag(true)
+                .disable_version_flag(true)
+                .arg(clap::Arg::new("run-pos").value_parser(["job", "log"]))
+                .arg(clap::Arg::new("env").long("env").value_parser(["dev", "prod"]))
+                .subcommand(
+                    Command::new("deploy")
+                        .visible_alias("d")
+                        .disable_help_flag(true)
+                        .disable_version_flag(true)
+                        .arg(clap::Arg::new("deploy-pos").value_parser(["plan", "force"]))
+                        .arg(
+                            clap::Arg::new("target")
+                                .long("target")
+                                .value_parser(["local", "remote"]),
+                        ),
+                ),
+        )
+        .subcommand(
+            Command::new("inspect")
+                .visible_alias("i")
+                .disable_help_flag(true)
+                .disable_version_flag(true),
+        )
+}
+
+fn complete_subcommand_alias_tool(args: &[&str]) -> Vec<CompletionCandidate> {
+    let mut cmd = subcommand_alias_tool_cmd();
+    let args: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
+    let arg_index = args.len() - 1;
+    clap_complete::engine::complete(&mut cmd, args, arg_index, None).unwrap()
+}
+
+fn subcommand_alias_tool_values(args: &[&str]) -> Vec<String> {
+    complete_subcommand_alias_tool(args)
+        .into_iter()
+        .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+        .collect()
+}
+
+#[test]
+fn subcommand_alias_root_lists_names_and_visible_aliases() {
+    // The empty word lists both canonical names and their visible aliases;
+    // the hidden alias `legacy-run` must not appear.
+    assert_eq!(
+        subcommand_alias_tool_values(&["tool", ""]),
+        ["r", "run", "i", "inspect", "config", "status"]
+    );
+}
+
+#[test]
+fn subcommand_alias_name_prefix_returns_only_matches() {
+    assert_eq!(subcommand_alias_tool_values(&["tool", "r"]), ["r", "run"]);
+    assert_eq!(subcommand_alias_tool_values(&["tool", "ru"]), ["run"]);
+    assert_eq!(subcommand_alias_tool_values(&["tool", "i"]), ["i", "inspect"]);
+    assert_eq!(
+        subcommand_alias_tool_values(&["tool", "run", "d"]),
+        ["d", "deploy"]
+    );
+    assert_eq!(
+        subcommand_alias_tool_values(&["tool", "r", "d"]),
+        ["d", "deploy"]
+    );
+}
+
+#[test]
+fn subcommand_alias_hidden_alias_only_when_typed() {
+    // The hidden alias is never listed alongside the visible candidates, but
+    // typing enough of it completes it so it can be used to descend.
+    assert_eq!(
+        subcommand_alias_tool_values(&["tool", "legacy-r"]),
+        ["legacy-run"]
+    );
+    assert_eq!(
+        subcommand_alias_tool_values(&["tool", "legacy-run"]),
+        ["legacy-run"]
+    );
+}
+
+#[test]
+fn subcommand_alias_paths_match_canonical_level() {
+    // Entering `run` through its canonical name, its visible alias, or its
+    // (typed) hidden alias yields the same next level: no parent positionals,
+    // no sibling subcommands, no hidden aliases.
+    let expected = ["d", "deploy", "job", "log", "--env"];
+    assert_eq!(subcommand_alias_tool_values(&["tool", "run", ""]), expected);
+    assert_eq!(subcommand_alias_tool_values(&["tool", "r", ""]), expected);
+    assert_eq!(
+        subcommand_alias_tool_values(&["tool", "legacy-run", ""]),
+        expected
+    );
+
+    let canonical = candidate_metadata(complete_subcommand_alias_tool(&["tool", "run", ""]));
+    for args in [&["tool", "r", ""][..], &["tool", "legacy-run", ""][..]] {
+        assert_eq!(
+            candidate_metadata(complete_subcommand_alias_tool(args)),
+            canonical,
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
+fn subcommand_alias_nested_paths_match_canonical_level() {
+    // `r d`, `run d`, `r deploy`, and `run deploy` all address the same
+    // `deploy` level.
+    let expected = ["plan", "force", "--target"];
+    let canonical = candidate_metadata(complete_subcommand_alias_tool(&[
+        "tool", "run", "deploy", "",
+    ]));
+    for args in [
+        &["tool", "run", "deploy", ""][..],
+        &["tool", "run", "d", ""][..],
+        &["tool", "r", "deploy", ""][..],
+        &["tool", "r", "d", ""][..],
+        &["tool", "legacy-run", "d", ""][..],
+    ] {
+        assert_eq!(subcommand_alias_tool_values(args), expected, "{args:?}");
+        assert_eq!(
+            candidate_metadata(complete_subcommand_alias_tool(args)),
+            canonical,
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
+fn subcommand_alias_option_values_via_alias_path() {
+    // Space- and equals-separated forms keep their value candidates, prefix
+    // forms, and metadata when the path went through aliases.
+    for prefix in [
+        &["tool", "run"][..],
+        &["tool", "r"][..],
+        &["tool", "legacy-run"][..],
+    ] {
+        let mut args = prefix.to_vec();
+        args.extend(["--env", ""]);
+        assert_eq!(subcommand_alias_tool_values(&args), ["dev", "prod"], "{args:?}");
+
+        let mut args = prefix.to_vec();
+        args.extend(["--env", "d"]);
+        assert_eq!(subcommand_alias_tool_values(&args), ["dev"], "{args:?}");
+
+        let mut args = prefix.to_vec();
+        args.extend(["--env="]);
+        assert_eq!(
+            subcommand_alias_tool_values(&args),
+            ["--env=dev", "--env=prod"],
+            "{args:?}"
+        );
+
+        let mut args = prefix.to_vec();
+        args.extend(["--env=p"]);
+        assert_eq!(subcommand_alias_tool_values(&args), ["--env=prod"], "{args:?}");
+    }
+
+    // Space and equals forms see the same state for the next word.
+    let spaced = candidate_metadata(complete_subcommand_alias_tool(&[
+        "tool", "r", "--env", "dev", "",
+    ]));
+    let attached = candidate_metadata(complete_subcommand_alias_tool(&[
+        "tool", "r", "--env=dev", "",
+    ]));
+    assert_eq!(spaced, attached);
+
+    // Same for the nested `deploy` level's option.
+    for prefix in [
+        &["tool", "run", "deploy"][..],
+        &["tool", "r", "d"][..],
+    ] {
+        let mut args = prefix.to_vec();
+        args.extend(["--target", ""]);
+        assert_eq!(
+            subcommand_alias_tool_values(&args),
+            ["local", "remote"],
+            "{args:?}"
+        );
+
+        let mut args = prefix.to_vec();
+        args.extend(["--target="]);
+        assert_eq!(
+            subcommand_alias_tool_values(&args),
+            ["--target=local", "--target=remote"],
+            "{args:?}"
+        );
+
+        let mut args = prefix.to_vec();
+        args.extend(["--target", "r"]);
+        assert_eq!(subcommand_alias_tool_values(&args), ["remote"], "{args:?}");
+    }
+}
+
+#[test]
+fn subcommand_alias_terminator_stays_at_current_level() {
+    // After `--` only the current level's positionals complete, whichever
+    // alias path was used to get there.
+    assert_eq!(
+        subcommand_alias_tool_values(&["tool", "--", ""]),
+        ["config", "status"]
+    );
+    assert_eq!(
+        subcommand_alias_tool_values(&["tool", "r", "--", ""]),
+        ["job", "log"]
+    );
+    assert_eq!(
+        subcommand_alias_tool_values(&["tool", "run", "--", ""]),
+        ["job", "log"]
+    );
+    assert_eq!(
+        subcommand_alias_tool_values(&["tool", "r", "d", "--", ""]),
+        ["plan", "force"]
+    );
+    assert_eq!(
+        subcommand_alias_tool_values(&["tool", "run", "deploy", "--", ""]),
+        ["plan", "force"]
+    );
+
+    // Prefix filtering still applies to the current level's positionals.
+    assert_eq!(
+        subcommand_alias_tool_values(&["tool", "r", "--", "j"]),
+        ["job"]
+    );
+    assert_eq!(
+        subcommand_alias_tool_values(&["tool", "r", "d", "--", "f"]),
+        ["force"]
+    );
+
+    // Aliases, option-style words, and unknown words after `--` are positional
+    // values that match nothing: successful empty results, with no level
+    // switching and no fallback to the parent level.
+    for word in ["r", "run", "legacy-run", "d", "deploy", "--env", "--target", "-x", "bogus"] {
+        assert!(
+            subcommand_alias_tool_values(&["tool", "r", "--", word]).is_empty(),
+            "unexpected candidates for {word:?}"
+        );
+        assert!(
+            subcommand_alias_tool_values(&["tool", "r", "d", "--", word]).is_empty(),
+            "unexpected candidates for {word:?}"
+        );
+    }
+    for word in ["r", "run", "i", "inspect", "--env", "bogus"] {
+        assert!(
+            subcommand_alias_tool_values(&["tool", "--", word]).is_empty(),
+            "unexpected candidates for {word:?}"
+        );
+    }
+}
+
+#[test]
+fn subcommand_alias_invalid_prefix_stays_successful_and_clean() {
+    // A prefix that matches no name or alias is a successful empty result.
+    assert!(subcommand_alias_tool_values(&["tool", "x"]).is_empty());
+    assert!(subcommand_alias_tool_values(&["tool", "run", "x"]).is_empty());
+    assert!(subcommand_alias_tool_values(&["tool", "r", "x"]).is_empty());
+
+    // The unknown word is consumed as the level's positional; completion of
+    // the following word still reflects exactly the current level.
+    assert_eq!(
+        subcommand_alias_tool_values(&["tool", "rx", ""]),
+        ["r", "run", "i", "inspect"]
+    );
+    assert_eq!(
+        subcommand_alias_tool_values(&["tool", "r", "rx", ""]),
+        ["d", "deploy", "--env"]
+    );
+    assert_eq!(
+        subcommand_alias_tool_values(&["tool", "r", "d", "rx", ""]),
+        ["--target"]
+    );
 }
 
 fn complete(cmd: &mut Command, args: impl AsRef<str>, current_dir: Option<&Path>) -> String {

@@ -605,13 +605,27 @@ fn subcommands(p: &clap::Command) -> Vec<CompletionCandidate> {
     debug!("subcommands: Has subcommands...{:?}", p.has_subcommands());
     p.get_subcommands()
         .flat_map(|sc| {
-            sc.get_name_and_visible_aliases()
-                .into_iter()
-                .map(|s| populate_command_candidate(CompletionCandidate::new(s.to_owned()), p, sc))
-                .chain(sc.get_aliases().map(|s| {
-                    populate_command_candidate(CompletionCandidate::new(s.to_owned()), p, sc)
-                        .hide(true)
-                }))
+            // The canonical name and its hidden aliases share a dedup id, so a
+            // hidden alias is only shown when nothing else matches; visible
+            // aliases carry no id so they are listed alongside the canonical
+            // name as equivalent entry points.
+            let canonical = populate_command_candidate(
+                CompletionCandidate::new(sc.get_name().to_owned()),
+                p,
+                sc,
+            )
+            .id(Some(format!("command::{}", sc.get_name())));
+            let visible_aliases = sc
+                .get_visible_aliases()
+                .map(|s| populate_command_candidate(CompletionCandidate::new(s.to_owned()), p, sc));
+            let hidden_aliases = sc.get_aliases().map(|s| {
+                populate_command_candidate(CompletionCandidate::new(s.to_owned()), p, sc)
+                    .id(Some(format!("command::{}", sc.get_name())))
+                    .hide(true)
+            });
+            std::iter::once(canonical)
+                .chain(visible_aliases)
+                .chain(hidden_aliases)
         })
         .collect()
 }
@@ -623,7 +637,6 @@ fn populate_command_candidate(
 ) -> CompletionCandidate {
     candidate
         .help(subcommand.get_about().cloned())
-        .id(Some(format!("command::{}", subcommand.get_name())))
         .tag(Some(
             cmd.get_subcommand_help_heading()
                 .unwrap_or("Commands")
