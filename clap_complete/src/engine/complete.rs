@@ -77,6 +77,16 @@ pub fn complete(
                 parse_positional(current_cmd, pos_index, is_escaped, current_state);
         } else if arg.is_escape() {
             is_escaped = true;
+            // Like the parser, `--` jumps straight to a `last(true)`
+            // positional, skipping any unfilled positionals.
+            if let Some(last_index) = current_cmd
+                .get_positionals()
+                .filter(|p| p.is_last_set())
+                .filter_map(|p| p.get_index())
+                .max()
+            {
+                pos_index = last_index;
+            }
         } else if opt_allows_hyphen(&current_state, &arg) {
             match current_state {
                 ParseState::Opt((opt, count)) => next_state = parse_opt_value(opt, count),
@@ -181,10 +191,7 @@ fn complete_arg(
                 }
             }
 
-            if let Some(positional) = cmd
-                .get_positionals()
-                .find(|p| p.get_index() == Some(pos_index))
-            {
+            if let Some(positional) = find_positional(cmd, pos_index, is_escaped) {
                 completions.extend(complete_arg_value(
                     arg.to_value(),
                     positional,
@@ -197,10 +204,7 @@ fn complete_arg(
             }
         }
         ParseState::Pos((_, num_arg)) => {
-            if let Some(positional) = cmd
-                .get_positionals()
-                .find(|p| p.get_index() == Some(pos_index))
-            {
+            if let Some(positional) = find_positional(cmd, pos_index, is_escaped) {
                 completions.extend(complete_arg_value(
                     arg.to_value(),
                     positional,
@@ -808,6 +812,15 @@ fn args_conflict(cmd: &clap::Command, first: &clap::Arg, second: &clap::Arg) -> 
             .get_arg_conflicts_with(second)
             .iter()
             .any(|c| c.get_id() == first.get_id())
+}
+
+/// The positional the parser would fill at `pos_index`.
+///
+/// A `last(true)` positional only exists after `--`; before the terminator
+/// the parser rejects values for it, so it must not be completed.
+fn find_positional(cmd: &clap::Command, pos_index: usize, is_escaped: bool) -> Option<&clap::Arg> {
+    cmd.get_positionals()
+        .find(|p| p.get_index() == Some(pos_index) && (is_escaped || !p.is_last_set()))
 }
 
 /// Parse the positional arguments. Return the new state and the new positional index.

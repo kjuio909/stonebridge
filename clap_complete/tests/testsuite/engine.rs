@@ -3063,6 +3063,270 @@ fn nested_color_preserves_candidate_metadata() {
     assert_eq!(escaped, expected);
 }
 
+fn trailing_tool_cmd() -> Command {
+    Command::new("tool")
+        .disable_help_flag(true)
+        .disable_version_flag(true)
+        .disable_help_subcommand(true)
+        .arg(
+            clap::Arg::new("format")
+                .long("format")
+                .value_parser(["text", "json"]),
+        )
+        .arg(clap::Arg::new("root-pos").value_parser(["src", "dst"]))
+        .arg(
+            clap::Arg::new("trailing")
+                .last(true)
+                .num_args(1..=3)
+                .value_parser([
+                    PossibleValue::new("--raw").help("Emit raw data"),
+                    PossibleValue::new("--meta").help("Emit metadata"),
+                    PossibleValue::new("word"),
+                ]),
+        )
+        .subcommand(
+            Command::new("run")
+                .disable_help_flag(true)
+                .disable_version_flag(true)
+                .disable_help_subcommand(true)
+                .arg(clap::Arg::new("run-pos").value_parser(["build", "test"]))
+                .arg(
+                    clap::Arg::new("run-trailing")
+                        .last(true)
+                        .num_args(1..=2)
+                        .value_parser([
+                            PossibleValue::new("--trace").help("Trace execution"),
+                            PossibleValue::new("--keep").help("Keep artifacts"),
+                            PossibleValue::new("arg"),
+                        ]),
+                ),
+        )
+}
+
+fn complete_trailing_tool(args: &[&str]) -> Vec<CompletionCandidate> {
+    let mut cmd = trailing_tool_cmd();
+    let args: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
+    let arg_index = args.len() - 1;
+    clap_complete::engine::complete(&mut cmd, args, arg_index, None).unwrap()
+}
+
+fn trailing_tool_values(args: &[&str]) -> Vec<String> {
+    complete_trailing_tool(args)
+        .into_iter()
+        .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+        .collect()
+}
+
+#[test]
+fn trailing_values_hidden_before_terminator() {
+    // The `last(true)` positional only exists after `--`: neither the empty
+    // word nor a filled normal positional may reveal its values.
+    assert_eq!(
+        trailing_tool_values(&["tool", ""]),
+        ["run", "src", "dst", "--format"]
+    );
+    assert_eq!(trailing_tool_values(&["tool", "src", ""]), ["run", "--format"]);
+    assert_eq!(trailing_tool_values(&["tool", "run", ""]), ["build", "test"]);
+    assert!(trailing_tool_values(&["tool", "run", "build", ""]).is_empty());
+
+    // A `--` prefix completes options, never the trailing values.
+    assert_eq!(trailing_tool_values(&["tool", "--"]), ["--format"]);
+    // `word` is a trailing value and must not leak into normal completion.
+    assert!(trailing_tool_values(&["tool", "w"]).is_empty());
+    assert_eq!(trailing_tool_values(&["tool", "s"]), ["src"]);
+}
+
+#[test]
+fn terminator_reveals_trailing_values() {
+    // `--` jumps straight to the `last(true)` positional, skipping the
+    // unfilled normal positional.
+    assert_eq!(
+        trailing_tool_values(&["tool", "--", ""]),
+        ["--raw", "--meta", "word"]
+    );
+    assert_eq!(trailing_tool_values(&["tool", "--", "--r"]), ["--raw"]);
+    assert_eq!(trailing_tool_values(&["tool", "--", "--m"]), ["--meta"]);
+    assert_eq!(trailing_tool_values(&["tool", "--", "w"]), ["word"]);
+
+    assert_eq!(
+        trailing_tool_values(&["tool", "run", "--", ""]),
+        ["--trace", "--keep", "arg"]
+    );
+    assert_eq!(trailing_tool_values(&["tool", "run", "--", "--t"]), ["--trace"]);
+    assert_eq!(trailing_tool_values(&["tool", "run", "--", "--k"]), ["--keep"]);
+    assert_eq!(trailing_tool_values(&["tool", "run", "--", "a"]), ["arg"]);
+}
+
+#[test]
+fn trailing_values_repeat_until_max() {
+    // Up to three trailing values; the candidate range stays the same until
+    // the maximum is reached, then completion is a successful empty result.
+    assert_eq!(
+        trailing_tool_values(&["tool", "--", "word", ""]),
+        ["--raw", "--meta", "word"]
+    );
+    assert_eq!(
+        trailing_tool_values(&["tool", "--", "--raw", "--meta", ""]),
+        ["--raw", "--meta", "word"]
+    );
+    assert!(trailing_tool_values(&["tool", "--", "word", "word", "word", ""]).is_empty());
+    assert!(trailing_tool_values(&["tool", "--", "word", "word", "word", "word", ""]).is_empty());
+
+    // The `run` level allows at most two trailing values.
+    assert_eq!(
+        trailing_tool_values(&["tool", "run", "--", "arg", ""]),
+        ["--trace", "--keep", "arg"]
+    );
+    assert!(trailing_tool_values(&["tool", "run", "--", "arg", "arg", ""]).is_empty());
+    assert!(trailing_tool_values(&["tool", "run", "--", "arg", "arg", "arg", ""]).is_empty());
+}
+
+#[test]
+fn pending_option_terminated_by_escape_enters_trailing_scope() {
+    // `--` cancels the pending `--format` value; `text` and `json` must not
+    // be offered, only the trailing values.
+    assert_eq!(
+        trailing_tool_values(&["tool", "--format", "--", ""]),
+        ["--raw", "--meta", "word"]
+    );
+    assert_eq!(
+        trailing_tool_values(&["tool", "--format", "--", "--r"]),
+        ["--raw"]
+    );
+    assert!(trailing_tool_values(&["tool", "--format", "--", "t"]).is_empty());
+
+    // A completed `--format` does not change the trailing scope either.
+    assert_eq!(
+        trailing_tool_values(&["tool", "--format", "text", "--", ""]),
+        ["--raw", "--meta", "word"]
+    );
+
+    // The equals form keeps its `--format=` prefix before the terminator.
+    assert_eq!(
+        trailing_tool_values(&["tool", "--format="]),
+        ["--format=text", "--format=json"]
+    );
+    assert_eq!(
+        trailing_tool_values(&["tool", "--format=t"]),
+        ["--format=text"]
+    );
+}
+
+#[test]
+fn no_options_or_subcommands_after_trailing() {
+    // Once the trailing values start, option and subcommand names are plain
+    // values: they must not be re-recognized, and the trailing candidates
+    // keep being offered while values remain.
+    assert_eq!(
+        trailing_tool_values(&["tool", "--", "word", "run", ""]),
+        ["--raw", "--meta", "word"]
+    );
+    assert_eq!(
+        trailing_tool_values(&["tool", "--", "word", "--format", ""]),
+        ["--raw", "--meta", "word"]
+    );
+    assert_eq!(
+        trailing_tool_values(&["tool", "--", "word", "--", ""]),
+        ["--raw", "--meta", "word"]
+    );
+    assert_eq!(
+        trailing_tool_values(&["tool", "run", "--", "--format", ""]),
+        ["--trace", "--keep", "arg"]
+    );
+
+    // Completing an option- or subcommand-like word itself matches nothing.
+    assert!(trailing_tool_values(&["tool", "--", "--f"]).is_empty());
+    assert!(trailing_tool_values(&["tool", "--", "run"]).is_empty());
+    assert!(trailing_tool_values(&["tool", "run", "--", "--f"]).is_empty());
+}
+
+#[test]
+fn trailing_invalid_inputs_empty_and_do_not_pollute() {
+    let mut cmd = trailing_tool_cmd();
+    let complete = |cmd: &mut Command, args: &[&str]| {
+        let args: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
+        let arg_index = args.len() - 1;
+        clap_complete::engine::complete(cmd, args, arg_index, None)
+            .unwrap()
+            .into_iter()
+            .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+    };
+
+    // An invalid `--format` value, attached or separate.
+    assert!(complete(&mut cmd, &["tool", "--format", "bogus"]).is_empty());
+    assert!(complete(&mut cmd, &["tool", "--format=bogus"]).is_empty());
+    // An invalid trailing word.
+    assert!(complete(&mut cmd, &["tool", "--", "bogus"]).is_empty());
+    assert!(complete(&mut cmd, &["tool", "run", "--", "bogus"]).is_empty());
+    // More trailing values than allowed.
+    assert!(complete(&mut cmd, &["tool", "--", "word", "word", "word", ""]).is_empty());
+    assert!(complete(&mut cmd, &["tool", "run", "--", "arg", "arg", ""]).is_empty());
+    // Prefixes with no match.
+    assert!(complete(&mut cmd, &["tool", "--bogus"]).is_empty());
+    assert!(complete(&mut cmd, &["tool", "x"]).is_empty());
+    assert!(complete(&mut cmd, &["tool", "--", "x"]).is_empty());
+    assert!(complete(&mut cmd, &["tool", "run", "--", "x"]).is_empty());
+
+    // The failed inputs must not pollute later completions on the same
+    // command object.
+    assert_eq!(
+        complete(&mut cmd, &["tool", ""]),
+        ["run", "src", "dst", "--format"]
+    );
+    assert_eq!(
+        complete(&mut cmd, &["tool", "--", ""]),
+        ["--raw", "--meta", "word"]
+    );
+    assert_eq!(
+        complete(&mut cmd, &["tool", "run", "--", ""]),
+        ["--trace", "--keep", "arg"]
+    );
+}
+
+#[test]
+fn trailing_preserves_candidate_metadata() {
+    // Value, help, id, tag, display order, and hidden state of the trailing
+    // candidates must be identical no matter how the trailing scope was
+    // reached.
+    let baseline = candidate_metadata(complete_trailing_tool(&["tool", "--", ""]));
+    assert_eq!(
+        baseline,
+        candidate_metadata(complete_trailing_tool(&["tool", "--format", "--", ""]))
+    );
+    assert_eq!(
+        baseline,
+        candidate_metadata(complete_trailing_tool(&["tool", "--", "word", ""]))
+    );
+
+    // Help and hidden state come from the possible values.
+    let helps: Vec<_> = baseline.iter().map(|candidate| candidate.1.clone()).collect();
+    assert_eq!(
+        helps,
+        [
+            Some("Emit raw data".to_owned()),
+            Some("Emit metadata".to_owned()),
+            None,
+        ]
+    );
+    assert!(baseline.iter().all(|candidate| !candidate.5));
+
+    let run = candidate_metadata(complete_trailing_tool(&["tool", "run", "--", ""]));
+    assert_eq!(
+        run,
+        candidate_metadata(complete_trailing_tool(&["tool", "run", "--", "arg", ""]))
+    );
+    let helps: Vec<_> = run.iter().map(|candidate| candidate.1.clone()).collect();
+    assert_eq!(
+        helps,
+        [
+            Some("Trace execution".to_owned()),
+            Some("Keep artifacts".to_owned()),
+            None,
+        ]
+    );
+}
+
 fn complete(cmd: &mut Command, args: impl AsRef<str>, current_dir: Option<&Path>) -> String {
     let input = args.as_ref();
     let mut args = vec![std::ffi::OsString::from(cmd.get_name())];
