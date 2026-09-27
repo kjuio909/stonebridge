@@ -512,7 +512,6 @@ fn complete_subcommand(value: &str, cmd: &clap::Command) -> Vec<CompletionCandid
         }
     }
 
-    scs.sort();
     scs.dedup();
     scs
 }
@@ -607,23 +606,23 @@ fn subcommands(p: &clap::Command) -> Vec<CompletionCandidate> {
         .flat_map(|sc| {
             sc.get_name_and_visible_aliases()
                 .into_iter()
-                .map(|s| populate_command_candidate(CompletionCandidate::new(s.to_owned()), p, sc))
-                .chain(sc.get_aliases().map(|s| {
-                    populate_command_candidate(CompletionCandidate::new(s.to_owned()), p, sc)
-                        .hide(true)
-                }))
+                .map(|s| populate_command_candidate(s, p, sc))
+                .chain(
+                    sc.get_aliases()
+                        .map(|s| populate_command_candidate(s, p, sc).hide(true)),
+                )
         })
         .collect()
 }
 
 fn populate_command_candidate(
-    candidate: CompletionCandidate,
+    candidate_name: &str,
     cmd: &clap::Command,
     subcommand: &clap::Command,
 ) -> CompletionCandidate {
-    candidate
+    CompletionCandidate::new(candidate_name.to_owned())
         .help(subcommand.get_about().cloned())
-        .id(Some(format!("command::{}", subcommand.get_name())))
+        .id(Some(format!("command::{candidate_name}")))
         .tag(Some(
             cmd.get_subcommand_help_heading()
                 .unwrap_or("Commands")

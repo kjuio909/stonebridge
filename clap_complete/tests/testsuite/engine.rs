@@ -73,9 +73,22 @@ fn suggest_hidden_subcommand_and_aliases() {
                 .hide(true),
         );
 
-    assert_data_eq!(complete!(cmd, "test"), snapbox::str!["test_visible"]);
+    assert_data_eq!(
+        complete!(cmd, "test"),
+        snapbox::str![[r#"
+test_visible
+test_visible-alias_visible
+"#]]
+    );
 
-    assert_data_eq!(complete!(cmd, "test_h"), snapbox::str!["test_hidden"]);
+    assert_data_eq!(
+        complete!(cmd, "test_h"),
+        snapbox::str![[r#"
+test_hidden
+test_hidden-alias_visible
+test_hidden-alias_hidden
+"#]]
+    );
 
     assert_data_eq!(
         complete!(cmd, "test_hidden-alias_h"),
@@ -106,7 +119,9 @@ fn suggest_subcommand_aliases() {
         complete!(cmd, "hello"),
         snapbox::str![[r#"
 hello-world
+hello-world-foo
 hello-moon
+hello-moon-foo
 "#]],
     );
 }
@@ -1853,6 +1868,255 @@ fn terminator_preserves_candidate_metadata() {
 
     let escaped = metadata(complete_terminator_tool(&["tool", "run", "--", ""]));
     assert_eq!(escaped, expected);
+}
+
+fn alias_tool_cmd() -> Command {
+    Command::new("tool")
+        .disable_help_flag(true)
+        .disable_version_flag(true)
+        .disable_help_subcommand(true)
+        .arg(clap::Arg::new("root-pos").value_parser(["config", "status"]))
+        .subcommand(
+            Command::new("run")
+                .visible_alias("r")
+                .alias("legacy-run")
+                .about("Run a job")
+                .disable_help_flag(true)
+                .disable_version_flag(true)
+                .disable_help_subcommand(true)
+                .arg(clap::Arg::new("run-pos").value_parser(["job", "log"]))
+                .arg(
+                    clap::Arg::new("env")
+                        .long("env")
+                        .value_parser(["dev", "prod"])
+                        .help("Target environment"),
+                )
+                .subcommand(
+                    Command::new("deploy")
+                        .visible_alias("d")
+                        .about("Deploy a plan")
+                        .disable_help_flag(true)
+                        .disable_version_flag(true)
+                        .disable_help_subcommand(true)
+                        .arg(clap::Arg::new("deploy-pos").value_parser(["plan", "force"]))
+                        .arg(
+                            clap::Arg::new("target")
+                                .long("target")
+                                .value_parser(["local", "remote"])
+                                .help("Deploy target"),
+                        ),
+                ),
+        )
+        .subcommand(
+            Command::new("inspect")
+                .visible_alias("i")
+                .about("Inspect state")
+                .disable_help_flag(true)
+                .disable_version_flag(true)
+                .disable_help_subcommand(true),
+        )
+}
+
+fn complete_alias_tool(args: &[&str]) -> Vec<CompletionCandidate> {
+    let mut cmd = alias_tool_cmd();
+    let args: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
+    let arg_index = args.len() - 1;
+    clap_complete::engine::complete(&mut cmd, args, arg_index, None).unwrap()
+}
+
+fn alias_tool_values(args: &[&str]) -> Vec<String> {
+    complete_alias_tool(args)
+        .into_iter()
+        .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// Full candidate metadata, so that equivalence between a canonical path and
+/// its alias paths covers value, help, id, tag, display order, and hidden
+/// state, not just the displayed value.
+fn alias_tool_metadata(args: &[&str]) -> Vec<CandidateMetadata> {
+    candidate_metadata(complete_alias_tool(args))
+}
+
+#[test]
+fn root_empty_lists_names_and_visible_aliases() {
+    // Both primary names and their visible aliases are listed; the hidden
+    // alias `legacy-run` must not appear.
+    let values = alias_tool_values(&["tool", ""]);
+    assert_eq!(
+        values,
+        ["run", "r", "inspect", "i", "config", "status"]
+    );
+    assert!(!values.contains(&"legacy-run".to_owned()));
+}
+
+#[test]
+fn root_name_prefix_returns_only_matches() {
+    assert_eq!(alias_tool_values(&["tool", "r"]), ["run", "r"]);
+    assert_eq!(alias_tool_values(&["tool", "ru"]), ["run"]);
+    assert_eq!(alias_tool_values(&["tool", "i"]), ["inspect", "i"]);
+    assert_eq!(alias_tool_values(&["tool", "in"]), ["inspect"]);
+    // A prefix matching only the hidden alias still offers it, as no visible
+    // candidate matches.
+    assert_eq!(alias_tool_values(&["tool", "l"]), ["legacy-run"]);
+}
+
+#[test]
+fn visible_alias_descent_matches_canonical_path() {
+    // Entering `run` through its visible alias must offer the same candidates,
+    // with the same metadata, as the canonical path.
+    let canonical = alias_tool_metadata(&["tool", "run", ""]);
+    assert_eq!(
+        canonical,
+        alias_tool_metadata(&["tool", "r", ""])
+    );
+    let values: Vec<_> = canonical.iter().map(|candidate| candidate.0.clone()).collect();
+    assert_eq!(values, ["deploy", "d", "job", "log", "--env"]);
+}
+
+#[test]
+fn hidden_alias_descent_matches_canonical_path() {
+    // A fully typed hidden alias is a valid entry point into the subcommand.
+    let canonical = alias_tool_metadata(&["tool", "run", ""]);
+    assert_eq!(
+        canonical,
+        alias_tool_metadata(&["tool", "legacy-run", ""])
+    );
+}
+
+#[test]
+fn descended_scope_excludes_parent_and_siblings() {
+    // After descending, the parent level's positionals, sibling subcommands,
+    // and the hidden alias must not leak into the candidates.
+    let values = alias_tool_values(&["tool", "r", ""]);
+    for leaked in ["config", "status", "inspect", "i", "run", "legacy-run"] {
+        assert!(
+            !values.contains(&leaked.to_owned()),
+            "`{leaked}` must not be offered inside `run`"
+        );
+    }
+}
+
+#[test]
+fn nested_alias_descent_matches_canonical_path() {
+    // `r d`, `run d`, `r deploy`, and `run deploy` are equivalent paths into
+    // the `deploy` level.
+    let canonical = alias_tool_metadata(&["tool", "run", "deploy", ""]);
+    for path in [
+        &["tool", "r", "d", ""][..],
+        &["tool", "run", "d", ""][..],
+        &["tool", "r", "deploy", ""][..],
+        &["tool", "legacy-run", "d", ""][..],
+    ] {
+        assert_eq!(canonical, alias_tool_metadata(path), "path {path:?}");
+    }
+    let values: Vec<_> = canonical.iter().map(|candidate| candidate.0.clone()).collect();
+    assert_eq!(values, ["plan", "force", "--target"]);
+}
+
+#[test]
+fn option_values_under_alias_path() {
+    // Space-separated and `=`-attached option values behave the same under an
+    // alias path as on the canonical path, keeping candidates and metadata.
+    for args in [
+        &["tool", "r", "--env", ""][..],
+        &["tool", "legacy-run", "--env", ""][..],
+    ] {
+        assert_eq!(alias_tool_values(args), ["dev", "prod"]);
+        assert_eq!(
+            alias_tool_metadata(args),
+            alias_tool_metadata(&["tool", "run", "--env", ""])
+        );
+    }
+    assert_eq!(alias_tool_values(&["tool", "r", "--env", "p"]), ["prod"]);
+    assert_eq!(
+        alias_tool_values(&["tool", "r", "--env="]),
+        ["--env=dev", "--env=prod"]
+    );
+    assert_eq!(
+        alias_tool_metadata(&["tool", "r", "--env="]),
+        alias_tool_metadata(&["tool", "run", "--env="])
+    );
+    assert_eq!(
+        alias_tool_values(&["tool", "r", "--env=p"]),
+        ["--env=prod"]
+    );
+
+    // One level down, through two aliases.
+    assert_eq!(
+        alias_tool_values(&["tool", "r", "d", "--target", ""]),
+        ["local", "remote"]
+    );
+    assert_eq!(
+        alias_tool_metadata(&["tool", "r", "d", "--target", ""]),
+        alias_tool_metadata(&["tool", "run", "deploy", "--target", ""])
+    );
+    assert_eq!(
+        alias_tool_values(&["tool", "r", "d", "--target="]),
+        ["--target=local", "--target=remote"]
+    );
+    assert_eq!(
+        alias_tool_values(&["tool", "r", "d", "--target", "r"]),
+        ["remote"]
+    );
+}
+
+#[test]
+fn terminator_at_alias_level_completes_only_positionals() {
+    // `--` at the current (alias-entered) level leaves only that level's
+    // positional values.
+    assert_eq!(alias_tool_values(&["tool", "--", ""]), ["config", "status"]);
+    assert_eq!(alias_tool_values(&["tool", "r", "--", ""]), ["job", "log"]);
+    assert_eq!(
+        alias_tool_metadata(&["tool", "r", "--", ""]),
+        alias_tool_metadata(&["tool", "run", "--", ""])
+    );
+    assert_eq!(
+        alias_tool_values(&["tool", "r", "d", "--", ""]),
+        ["plan", "force"]
+    );
+}
+
+#[test]
+fn words_after_terminator_do_not_switch_levels() {
+    // After `--`, aliases, option-style words, and unknown words are
+    // positional values; none match, so completion succeeds with empty
+    // candidates instead of re-switching or falling back to another level.
+    assert!(alias_tool_values(&["tool", "r", "--", "d"]).is_empty());
+    assert!(alias_tool_values(&["tool", "r", "--", "deploy"]).is_empty());
+    assert!(alias_tool_values(&["tool", "r", "--", "--env"]).is_empty());
+    assert!(alias_tool_values(&["tool", "r", "--", "--e"]).is_empty());
+    assert!(alias_tool_values(&["tool", "r", "--", "bogus"]).is_empty());
+    // A subcommand name after the terminator must not descend.
+    assert!(alias_tool_values(&["tool", "--", "run", ""]).is_empty());
+    assert!(alias_tool_values(&["tool", "r", "--", "d", ""]).is_empty());
+}
+
+#[test]
+fn invalid_alias_prefix_is_empty_and_does_not_pollute() {
+    // An invalid name prefix successfully returns no candidates ...
+    let mut cmd = alias_tool_cmd();
+    let complete = |cmd: &mut Command, args: &[&str]| {
+        let args: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
+        let arg_index = args.len() - 1;
+        clap_complete::engine::complete(cmd, args, arg_index, None)
+            .unwrap()
+            .into_iter()
+            .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+    };
+    assert!(complete(&mut cmd, &["tool", "rx"]).is_empty());
+    assert!(complete(&mut cmd, &["tool", "run", "rx"]).is_empty());
+
+    // ... and later completions on the same command are unaffected.
+    assert_eq!(
+        complete(&mut cmd, &["tool", ""]),
+        ["run", "r", "inspect", "i", "config", "status"]
+    );
+    assert_eq!(
+        complete(&mut cmd, &["tool", "r", ""]),
+        ["deploy", "d", "job", "log", "--env"]
+    );
 }
 
 #[test]
