@@ -21,6 +21,45 @@ pub fn complete(
     debug!("complete: args={args:?}, arg_index={arg_index:?}, current_dir={current_dir:?}");
     cmd.build();
 
+    // A multicall binary treats the path it was launched from as the first
+    // word: `argv[0]`'s file stem selects one of the root subcommands, and the
+    // rest of the line is parsed within that applet. Applets are isolated
+    // entry points, so an unknown (or wrongly cased) applet name is a hard
+    // error rather than a fallback to the aggregate command's root level.
+    let is_multicall = cmd.is_multicall_set();
+    let mut args = args;
+    // Whether the first word selects an applet and therefore must be
+    // traversed like any other subcommand word instead of being skipped.
+    let mut first_word_is_applet = false;
+    if is_multicall {
+        let Some(argv0) = args.first() else {
+            // No words at all: there is nothing to complete.
+            return Err(std::io::Error::other("no completion generated"));
+        };
+        let stem = std::path::Path::new(argv0)
+            .file_stem()
+            .and_then(|stem| stem.to_str());
+        if let Some(stem) = stem {
+            let Some(applet) = cmd.find_subcommand(stem) else {
+                // An applet name that does not match (including a difference
+                // in case) is the parser's unrecognized-subcommand error; it
+                // must never fall back to the aggregate root's candidates.
+                return Err(std::io::Error::other(format!(
+                    "unrecognized subcommand '{stem}'"
+                )));
+            };
+            // Rewrite the launch path to the canonical applet name in place.
+            // The word count and `arg_index` are unchanged, and the `Command`
+            // itself is never mutated, so repeated calls cannot leak one
+            // applet's state into another.
+            args[0] = OsString::from(applet.get_name());
+            first_word_is_applet = true;
+        }
+        // A path with no file stem (or a non-UTF-8 stem) mirrors the parser:
+        // the word is consumed as an ordinary binary name and completion stays
+        // at the aggregate command's root level.
+    }
+
     let mut raw_args = clap_lex::RawArgs::new(args);
     let mut cursor = raw_args.cursor();
     let mut target_cursor = raw_args.cursor();
@@ -32,8 +71,9 @@ pub fn complete(
     raw_args.next_os(&mut target_cursor);
     debug!("complete: target_cursor={target_cursor:?}");
 
-    // TODO: Multicall support
-    if !cmd.is_no_binary_name_set() {
+    // In a multicall binary the selected applet is the first subcommand word
+    // and is traversed below; only an ordinary binary name is skipped here.
+    if !first_word_is_applet && !cmd.is_no_binary_name_set() {
         raw_args.next_os(&mut cursor);
     }
 

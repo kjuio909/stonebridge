@@ -4505,3 +4505,382 @@ fn complete(cmd: &mut Command, args: impl AsRef<str>, current_dir: Option<&Path>
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+// The aggregate multicall command declares the `busybox` and `status`
+// applets; the `busybox` applet dispatches the `status` and `stop`
+// subcommands, mirroring a busybox-style single binary.
+fn multicall_status_cmd() -> Command {
+    Command::new("status")
+        .about("Show status")
+        .disable_help_flag(true)
+        .disable_version_flag(true)
+        .disable_help_subcommand(true)
+        .arg(
+            clap::Arg::new("format")
+                .long("format")
+                .visible_alias("output")
+                .alias("fmt")
+                .help("Output format")
+                .value_parser([
+                    PossibleValue::new("text").help("Plain text"),
+                    PossibleValue::new("json").help("JSON output"),
+                ]),
+        )
+}
+
+fn multicall_stop_cmd() -> Command {
+    Command::new("stop")
+        .about("Stop things")
+        .alias("halt")
+        .disable_help_flag(true)
+        .disable_version_flag(true)
+        .disable_help_subcommand(true)
+}
+
+fn multicall_tool() -> Command {
+    Command::new("busybox")
+        .multicall(true)
+        .disable_help_flag(true)
+        .disable_version_flag(true)
+        .disable_help_subcommand(true)
+        .subcommand_value_name("APPLET")
+        .subcommand_help_heading("APPLETS")
+        .subcommand(
+            Command::new("busybox")
+                .disable_help_flag(true)
+                .disable_version_flag(true)
+                .disable_help_subcommand(true)
+                .subcommand_value_name("APPLET")
+                .subcommand_help_heading("APPLETS")
+                .subcommand(multicall_status_cmd())
+                .subcommand(multicall_stop_cmd()),
+        )
+        .subcommand(multicall_status_cmd())
+}
+
+fn multicall_complete(
+    cmd: &mut Command,
+    args: &[&str],
+) -> std::io::Result<Vec<CompletionCandidate>> {
+    let os_args: Vec<std::ffi::OsString> =
+        args.iter().map(std::ffi::OsString::from).collect();
+    let arg_index = args.len() - 1;
+    clap_complete::engine::complete(cmd, os_args, arg_index, None)
+}
+
+fn multicall_values(args: &[&str]) -> Vec<String> {
+    multicall_complete(&mut multicall_tool(), args)
+        .unwrap()
+        .into_iter()
+        .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+        .collect()
+}
+
+fn multicall_metadata(args: &[&str]) -> Vec<CandidateMetadata> {
+    candidate_metadata(multicall_complete(&mut multicall_tool(), args).unwrap())
+}
+
+#[test]
+fn multicall_busybox_empty_lists_only_applets() {
+    // Launched through the dispatcher's path, an empty last word completes
+    // inside the `busybox` applet: only its `status` and `stop` subcommands,
+    // never the aggregate command's root entries.
+    assert_eq!(multicall_values(&["/usr/bin/busybox", ""]), ["status", "stop"]);
+}
+
+#[test]
+fn multicall_launch_path_forms_select_the_same_applet() {
+    // A directory component, an executable extension, or a bare file name all
+    // reduce to the same `file_stem`, so applet selection is identical.
+    for argv0 in [
+        "busybox",
+        "./busybox",
+        "../bin/busybox",
+        "/usr/local/bin/busybox",
+        "busybox.exe",
+        "busybox.bin",
+        "/usr/bin/busybox.exe",
+    ] {
+        assert_eq!(
+            multicall_values(&[argv0, ""]),
+            ["status", "stop"],
+            "argv0 {argv0:?} selected a different applet"
+        );
+        assert_eq!(
+            multicall_metadata(&[argv0, ""]),
+            multicall_metadata(&["/usr/bin/busybox", ""]),
+            "argv0 {argv0:?} changed candidate metadata"
+        );
+    }
+}
+
+#[test]
+fn multicall_status_completes_format_values_in_both_forms() {
+    // After selecting `status`, the space-separated form completes the
+    // option's legal values.
+    assert_eq!(
+        multicall_values(&["/usr/bin/busybox", "status", "--format", ""]),
+        ["text", "json"]
+    );
+    assert_eq!(
+        multicall_values(&["/usr/bin/busybox", "status", "--format", "j"]),
+        ["json"]
+    );
+
+    // The `=`-attached form offers the same values, preserving the flag
+    // prefix, and a typed prefix is kept on every candidate.
+    assert_eq!(
+        multicall_values(&["/usr/bin/busybox", "status", "--format="]),
+        ["--format=text", "--format=json"]
+    );
+    assert_eq!(
+        multicall_values(&["/usr/bin/busybox", "status", "--format=t"]),
+        ["--format=text"]
+    );
+    assert_eq!(
+        multicall_values(&["/usr/bin/busybox", "status", "--format=j"]),
+        ["--format=json"]
+    );
+}
+
+#[test]
+fn multicail_status_invalid_prefix_is_successful_empty() {
+    assert!(
+        multicall_complete(&mut multicall_tool(), &[
+            "/usr/bin/busybox",
+            "status",
+            "--format=zzz"
+        ])
+        .unwrap()
+        .is_empty()
+    );
+    assert!(
+        multicall_values(&["/usr/bin/busybox", "status", "--format", "zzz"]).is_empty()
+    );
+}
+
+#[test]
+fn multicall_direct_applet_path_matches_dispatcher_path() {
+    // Launching the `status` applet directly is identical to reaching it via
+    // `busybox status`: candidates, order, help, id, tag, display order, and
+    // hidden state all match.
+    for direct in ["status", "./status", "/usr/bin/status", "status.exe"] {
+        assert_eq!(
+            multicall_metadata(&[direct, ""]),
+            multicall_metadata(&["/usr/bin/busybox", "status", ""]),
+            "direct {direct:?} vs dispatcher at empty word"
+        );
+        assert_eq!(
+            multicall_metadata(&[direct, "--format", ""]),
+            multicall_metadata(&["/usr/bin/busybox", "status", "--format", ""]),
+            "direct {direct:?} vs dispatcher for option values"
+        );
+        assert_eq!(
+            multicall_metadata(&[direct, "--format="]),
+            multicall_metadata(&["/usr/bin/busybox", "status", "--format="]),
+            "direct {direct:?} vs dispatcher for attached values"
+        );
+        assert_eq!(
+            multicall_metadata(&[direct, "--format=t"]),
+            multicall_metadata(&["/usr/bin/busybox", "status", "--format=t"]),
+            "direct {direct:?} vs dispatcher with typed prefix"
+        );
+    }
+
+    // The empty word under `status` offers its visible option spelling.
+    assert_eq!(
+        multicall_values(&["/usr/bin/status", ""]),
+        ["--format", "--output"]
+    );
+}
+
+#[test]
+fn multicall_hidden_spelling_matches_across_paths() {
+    // The hidden long alias only appears once its prefix is typed, and it
+    // carries the same hidden marker and other metadata on both entry paths.
+    let via_dispatcher =
+        multicall_metadata(&["/usr/bin/busybox", "status", "--fm"]);
+    let direct = multicall_metadata(&["/usr/bin/status", "--fm"]);
+    assert_eq!(via_dispatcher, direct);
+    assert_eq!(via_dispatcher.len(), 1);
+    assert_eq!(via_dispatcher[0].0, "--fmt");
+    assert!(via_dispatcher[0].5, "the hidden alias must stay hidden");
+
+    // The hidden `halt` alias of `stop` likewise only surfaces when typed.
+    assert_eq!(
+        multicall_values(&["/usr/bin/busybox", "ha"]),
+        ["halt"]
+    );
+    assert_eq!(
+        multicall_values(&["/usr/bin/busybox", ""]),
+        ["status", "stop"]
+    );
+}
+
+#[test]
+fn multicall_unknown_and_wrong_case_applet_error() {
+    // An applet name that is not declared, including one that only differs in
+    // case, reports the conventional unrecognized-subcommand error instead of
+    // falling back to the aggregate command's root candidates.
+    for argv0 in ["/usr/bin/nope", "nope", "nope.exe", "/usr/bin/Status", "STATUS"] {
+        let err = multicall_complete(&mut multicall_tool(), &[argv0, ""])
+            .expect_err("an unknown applet must error, never complete at the root");
+        let message = err.to_string();
+        assert!(
+            message.contains("unrecognized subcommand"),
+            "unexpected error for {argv0:?}: {message}"
+        );
+    }
+}
+
+#[test]
+fn multicall_applets_are_isolated_scopes() {
+    // The empty word under `stop` offers nothing of `status`.
+    assert!(multicall_values(&["/usr/bin/busybox", "stop", ""]).is_empty());
+    assert!(multicall_values(&["/usr/bin/stop", ""]).is_empty());
+
+    // Completing inside `status` never offers the sibling applets.
+    let status_options = multicall_values(&["/usr/bin/status", ""]);
+    assert!(status_options.contains(&"--format".to_owned()));
+    assert!(!status_options.contains(&"stop".to_owned()));
+    assert!(!status_options.contains(&"status".to_owned()));
+
+    // The dispatcher level never leaks `status`'s option.
+    let dispatcher = multicall_values(&["/usr/bin/busybox", ""]);
+    assert_eq!(dispatcher, ["status", "stop"]);
+}
+
+#[test]
+fn multicall_non_multicall_command_skips_binary_name() {
+    // Without `multicall(true)` the launch path is always skipped as the binary
+    // name, even when its file stem happens to equal a subcommand name.
+    let mut cmd = Command::new("root")
+        .disable_help_flag(true)
+        .disable_version_flag(true)
+        .disable_help_subcommand(true)
+        .subcommand(multicall_status_cmd());
+
+    // Had multicall applied, this would descend into `status` and offer
+    // `--format`; skipping the binary name keeps completion at the root.
+    let values = multicall_complete(&mut cmd, &["/usr/bin/status", ""])
+        .unwrap()
+        .into_iter()
+        .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(values, ["status"]);
+}
+
+#[test]
+fn multicall_no_binary_name_behavior_unchanged() {
+    // `no_binary_name` is incompatible with multicall and keeps its existing
+    // semantics: the very first word is an ordinary argument, not a launch
+    // path selecting an applet.
+    let mut cmd = Command::new("root")
+        .no_binary_name(true)
+        .disable_help_flag(true)
+        .disable_version_flag(true)
+        .disable_help_subcommand(true)
+        .subcommand(multicall_status_cmd());
+
+    let at_root = multicall_complete(&mut cmd, &[""])
+        .unwrap()
+        .into_iter()
+        .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(at_root, ["status"]);
+
+    let in_status = multicall_complete(&mut cmd, &["status", ""])
+        .unwrap()
+        .into_iter()
+        .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(in_status, ["--format", "--output"]);
+}
+
+#[test]
+fn multicall_terminator_and_words_after_it_do_not_error() {
+    // `status` has no positionals, so words after the terminator match nothing
+    // and completion succeeds with an empty set at both entry paths.
+    for path in [
+        &["/usr/bin/busybox", "status", "--", ""][..],
+        &["/usr/bin/status", "--", ""][..],
+        &["/usr/bin/busybox", "status", "--", "--format"][..],
+        &["/usr/bin/status", "--", "status"][..],
+        &["/usr/bin/busybox", "status", "bogus"][..],
+    ] {
+        assert!(
+            multicall_complete(&mut multicall_tool(), path).unwrap().is_empty(),
+            "expected no candidates for {path:?}"
+        );
+    }
+
+    // An empty argument list and an out-of-range cursor terminate gracefully
+    // with the ordinary "no completion" error rather than panicking.
+    let empty: Vec<std::ffi::OsString> = Vec::new();
+    assert!(clap_complete::engine::complete(&mut multicall_tool(), empty, 0, None).is_err());
+    let out_of_range: Vec<std::ffi::OsString> =
+        ["/usr/bin/busybox", ""].iter().map(std::ffi::OsString::from).collect();
+    assert!(
+        clap_complete::engine::complete(&mut multicall_tool(), out_of_range, 42, None).is_err()
+    );
+}
+
+#[test]
+fn multicall_reuse_recovers_and_never_leaks_between_applets() {
+    let mut cmd = multicall_tool();
+
+    // Failed applet selection and failed value completion must not poison the
+    // shared `Command`.
+    assert!(multicall_complete(&mut cmd, &["/usr/bin/nope", ""]).is_err());
+    assert!(multicall_complete(&mut cmd, &["/usr/bin/Status", ""]).is_err());
+    assert!(multicall_complete(
+        &mut cmd,
+        &["/usr/bin/busybox", "status", "--format=zzz"]
+    )
+    .unwrap()
+    .is_empty());
+
+    // The dispatcher applet still completes exactly as a fresh command.
+    assert_eq!(
+        candidate_metadata(multicall_complete(&mut cmd, &["/usr/bin/busybox", ""]).unwrap()),
+        multicall_metadata(&["/usr/bin/busybox", ""])
+    );
+
+    // The direct `status` applet is unaffected by the earlier failed dispatch.
+    assert_eq!(
+        candidate_metadata(multicall_complete(&mut cmd, &["/usr/bin/status", "--format", ""]).unwrap()),
+        multicall_metadata(&["/usr/bin/busybox", "status", "--format", ""])
+    );
+    assert_eq!(
+        multicall_complete(&mut cmd, &["/usr/bin/status", "--format=t"])
+            .unwrap()
+            .into_iter()
+            .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+        ["--format=text"]
+    );
+
+    // Visiting `status` must not leak its option into a later dispatcher or
+    // other-applet completion.
+    assert_eq!(
+        multicall_complete(&mut cmd, &["/usr/bin/busybox", ""])
+            .unwrap()
+            .into_iter()
+            .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+        ["status", "stop"]
+    );
+    assert!(multicall_complete(&mut cmd, &["/usr/bin/stop", ""])
+        .unwrap()
+        .is_empty());
+
+    // And after the other applet, `status` still offers its own values.
+    assert_eq!(
+        multicall_complete(&mut cmd, &["/usr/bin/status", "--format", ""])
+            .unwrap()
+            .into_iter()
+            .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+        ["text", "json"]
+    );
+}
