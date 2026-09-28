@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
 
+### Fixes
+
+- *(dynamic)* Respect `Arg::value_terminator`, completing an option's values until its terminator and resuming ordinary completion afterwards
+
 ## [4.6.10] - 2026-09-14
 
 ## [4.6.9] - 2026-08-06

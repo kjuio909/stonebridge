@@ -21,7 +21,7 @@ pub fn complete(
     debug!("complete: args={args:?}, arg_index={arg_index:?}, current_dir={current_dir:?}");
     cmd.build();
 
-    let raw_args = clap_lex::RawArgs::new(args);
+    let mut raw_args = clap_lex::RawArgs::new(args);
     let mut cursor = raw_args.cursor();
     let mut target_cursor = raw_args.cursor();
     raw_args.seek(
@@ -49,6 +49,40 @@ pub fn complete(
             "complete::next: arg={:?}, current_state={current_state:?}, cursor={cursor:?}",
             arg.to_value_os(),
         );
+        if let ParseState::Opt((opt, _)) = &current_state {
+            // A value terminator ends a multi-value option regardless of the
+            // word's shape: unlike a flag-like word, it never starts a new
+            // argument, and unlike any other word, it is never one of the
+            // option's values. A flag-shaped terminator only wins over flag
+            // parsing when the option accepts hyphen values, matching the
+            // parser's precedence.
+            if is_value_terminator(opt, &arg)
+                && (opt.is_allow_hyphen_values_set() || !is_flag_like(&arg))
+            {
+                if cursor == target_cursor {
+                    // The cursor sits on the terminator itself. Complete as if
+                    // it had already been submitted and an empty word followed,
+                    // so ordinary completion resumes and the terminator is not
+                    // offered as a candidate.
+                    raw_args.insert(&target_cursor, [OsString::new()]);
+                    let mut word_cursor = target_cursor;
+                    let word = raw_args
+                        .next(&mut word_cursor)
+                        .expect("an empty word was just inserted");
+                    return complete_arg(
+                        &word,
+                        current_cmd,
+                        current_dir,
+                        pos_index,
+                        is_escaped,
+                        ParseState::ValueDone,
+                        &used_args,
+                    );
+                }
+                next_state = ParseState::ValueDone;
+                continue;
+            }
+        }
         if cursor == target_cursor {
             return complete_arg(
                 &arg,
@@ -910,6 +944,21 @@ fn opt_allows_hyphen(state: &ParseState<'_>, arg: &clap_lex::ParsedArg<'_>) -> b
     }
 
     false
+}
+
+/// Whether `arg` is the standalone value terminator of a pending option.
+///
+/// Like the parser, an attached value (`--opt=;`) is not a terminator: the
+/// word must consist of the terminator alone.
+fn is_value_terminator(opt: &clap::Arg, arg: &clap_lex::ParsedArg<'_>) -> bool {
+    opt.get_value_terminator()
+        .is_some_and(|term| arg.to_value_os() == OsStr::new(term.as_str()))
+}
+
+/// Whether the parser would route this word through flag/escape parsing before
+/// a pending option gets to consume it as a value.
+fn is_flag_like(arg: &clap_lex::ParsedArg<'_>) -> bool {
+    arg.is_escape() || arg.to_long().is_some() || arg.to_short().is_some()
 }
 
 /// Whether a word can terminate a still-open multi-value option and start a
