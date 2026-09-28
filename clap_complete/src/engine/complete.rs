@@ -107,6 +107,31 @@ pub fn complete(
             }
         }
 
+        // With external subcommands enabled, the first non-flag-shaped word
+        // that is neither a declared subcommand nor a value of the positional
+        // at the current index is parsed as the external program's name, the
+        // way the parser routes it. The word under the cursor never reaches
+        // here (it is completed above), so this only fires once the name has
+        // been submitted; every following word — plain words, options of any
+        // shape, other subcommand names, repeated unknowns and the `--`
+        // terminator — belongs to the external program and yields a successful
+        // empty set. A pending strict delimited group is handled above this
+        // point, so an unfinished `--tag` value keeps owning words instead of
+        // starting an external command.
+        if current_cmd.is_allow_external_subcommands_set()
+            && !is_escaped
+            && !is_flag_like(&arg)
+            && matches!(current_state, ParseState::ValueDone)
+            && find_positional(current_cmd, pos_index, false).is_none()
+        {
+            let is_subcommand = arg
+                .to_value()
+                .is_ok_and(|value| current_cmd.find_subcommand(value).is_some());
+            if !is_subcommand {
+                return Ok(Vec::new());
+            }
+        }
+
         // A strict delimited group whose previous word opened another fragment
         // (a trailing delimiter) or went invalid owns the next word outright: a
         // flag, the `--` escape, or a subcommand name is then another value of

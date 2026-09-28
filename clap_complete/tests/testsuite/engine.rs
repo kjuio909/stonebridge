@@ -4107,6 +4107,252 @@ fn define_bad_inputs_do_not_pollute_command_state() {
     assert_eq!(values, ["run", "src", "dst", "--define", "--verbose"]);
 }
 
+fn external_tool_cmd() -> Command {
+    // The command from the external-subcommand completion contract: `tool` with
+    // auto help and version off and external subcommands enabled; a
+    // repeatable comma-separated multi-value `--tag` of red/green/blue at the
+    // root, and a plain `run` subcommand with job/log positional values.
+    Command::new("tool")
+        .disable_help_flag(true)
+        .disable_version_flag(true)
+        .disable_help_subcommand(true)
+        .allow_external_subcommands(true)
+        .arg(
+            clap::Arg::new("tag")
+                .long("tag")
+                .action(clap::ArgAction::Append)
+                .num_args(1..=3)
+                .value_delimiter(',')
+                .value_parser(["red", "green", "blue"]),
+        )
+        .subcommand(
+            Command::new("run")
+                .disable_help_flag(true)
+                .disable_version_flag(true)
+                .arg(clap::Arg::new("run-pos").value_parser(["job", "log"])),
+        )
+}
+
+fn complete_external_tool_with(
+    cmd: &mut Command,
+    args: &[&str],
+) -> Vec<CompletionCandidate> {
+    let os_args: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
+    let arg_index = os_args.len() - 1;
+    clap_complete::engine::complete(cmd, os_args, arg_index, None).unwrap()
+}
+
+fn complete_external_tool(args: &[&str]) -> Vec<CompletionCandidate> {
+    let mut cmd = external_tool_cmd();
+    complete_external_tool_with(&mut cmd, args)
+}
+
+fn external_values(args: &[&str]) -> Vec<String> {
+    complete_external_tool(args)
+        .into_iter()
+        .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+        .collect()
+}
+
+#[test]
+fn external_tool_root_empty_lists_only_declared() {
+    // An empty word at the root lists the declared `--tag` and `run` with their
+    // existing metadata and must never fabricate an external command. The
+    // run-level job/log values never leak to the root.
+    assert_eq!(
+        candidate_metadata(complete_external_tool(&["tool", ""])),
+        vec![
+            (
+                "run".to_owned(),
+                None,
+                Some("command::run".to_owned()),
+                Some("Commands".to_owned()),
+                Some(1),
+                false,
+            ),
+            (
+                "--tag".to_owned(),
+                None,
+                Some("arg::tag".to_owned()),
+                Some("Options".to_owned()),
+                Some(0),
+                false,
+            ),
+        ]
+    );
+}
+
+#[test]
+fn external_tool_first_unknown_word_is_still_completed_as_a_word() {
+    // While the cursor sits on the first unknown word, it is just a word being
+    // typed: a prefix of `run` matches only `run`, and an unknown prefix or a
+    // fully typed unknown name offers nothing (it is not echoed back and no
+    // external candidate is invented).
+    assert_eq!(external_values(&["tool", "r"]), ["run"]);
+    assert_eq!(external_values(&["tool", "ru"]), ["run"]);
+    assert_eq!(external_values(&["tool", "x"]), Vec::<String>::new());
+    assert_eq!(external_values(&["tool", "foo"]), Vec::<String>::new());
+}
+
+#[test]
+fn external_tool_next_empty_word_enters_external_zone() {
+    // Once the unknown name has been submitted and the cursor is on the next
+    // empty word, completion belongs to the external program's argument zone:
+    // a successful empty set, never the root options/subcommand.
+    assert_eq!(external_values(&["tool", "foo", ""]), Vec::<String>::new());
+}
+
+#[test]
+fn external_tool_zone_holds_every_later_word_shape() {
+    // Plain words, any option style, the declared `run` subcommand name and a
+    // repeated unknown word all stay inside the external argument zone: empty
+    // success, never falling back to the root, never suggesting `--tag`, `run`
+    // or their aliases.
+    for word in [
+        "bar",
+        "--tag",
+        "--unknown",
+        "--unknown=value",
+        "-x",
+        "-",
+        "run",
+        "foo",
+    ] {
+        assert!(
+            external_values(&["tool", "foo", word]).is_empty(),
+            "unexpected candidates for external arg {word:?}"
+        );
+        assert!(
+            external_values(&["tool", "foo", word, ""]).is_empty(),
+            "unexpected candidates after external arg {word:?}"
+        );
+    }
+}
+
+#[test]
+fn external_tool_terminator_and_following_words_stay_in_zone() {
+    // The `--` terminator is itself an external argument while in the zone,
+    // whether the cursor rests on it or on a following word; nothing after it
+    // returns to the root either.
+    for args in [
+        &["tool", "foo", "--"][..],
+        &["tool", "foo", "--", ""][..],
+        &["tool", "foo", "--", "bar"][..],
+        &["tool", "foo", "bar", "--", "x"][..],
+    ] {
+        assert!(
+            external_values(args).is_empty(),
+            "unexpected candidates for {args:?}"
+        );
+    }
+}
+
+#[test]
+fn external_tool_pending_tag_fragment_takes_precedence() {
+    // A `--tag` value still being typed (a trailing comma opened another
+    // fragment) owns the next word under the tag rules; an unknown word there
+    // is not yet an external command.
+    assert_eq!(
+        external_values(&["tool", "--tag", "red,", ""]),
+        ["green", "blue"]
+    );
+    assert_eq!(
+        external_values(&["tool", "--tag=red,", ""]),
+        ["green", "blue"]
+    );
+    for word in ["foo", "run", "--unknown", "-x", "--"] {
+        assert!(
+            external_values(&["tool", "--tag", "red,", word]).is_empty(),
+            "pending tag fragment unexpectedly released {word:?}"
+        );
+    }
+
+    // Only after the tag group is complete does a later unknown first word
+    // switch into the external zone, in both space and equals forms.
+    assert!(external_values(&["tool", "--tag", "red,green,blue", "foo", ""]).is_empty());
+    assert!(external_values(&["tool", "--tag=red,green,blue", "foo", ""]).is_empty());
+}
+
+#[test]
+fn external_tool_invalid_inputs_are_successful_empty_sets() {
+    // Illegal tag fragments, a prefix without a match, and out-of-range
+    // positional values never error and never leak candidates, whether at the
+    // root or inside `run`.
+    for args in [
+        &["tool", "--tag", "zzz"][..],
+        &["tool", "--tag=zzz"][..],
+        &["tool", "--tag", "red,red"][..],
+        &["tool", "--tag", "red,,green"][..],
+        &["tool", "run", "zzz"][..],
+        &["tool", "run", "job", "zzz", ""][..],
+    ] {
+        assert!(
+            external_values(args).is_empty(),
+            "expected a successful empty set for {args:?}"
+        );
+    }
+}
+
+#[test]
+fn external_tool_zone_and_failures_do_not_change_command_state() {
+    let mut cmd = external_tool_cmd();
+
+    // Drive external-zone lines and failing lines on the same Command object.
+    for args in [
+        &["tool", "foo", "--tag"][..],
+        &["tool", "foo", "run"][..],
+        &["tool", "foo", "--"][..],
+        &["tool", "foo", "bar", "--", "x"][..],
+        &["tool", "--tag", "zzz"][..],
+        &["tool", "--tag", "red,red"][..],
+        &["tool", "run", "zzz"][..],
+    ] {
+        assert!(
+            complete_external_tool_with(&mut cmd, args).is_empty(),
+            "expected empty success for {args:?}"
+        );
+    }
+
+    // Afterwards root, tag and run-level completion must be byte-for-byte
+    // identical (set, order, text, help, id, group tag, display order and
+    // hidden marker) to the same call on a command that never saw those lines.
+    for args in [
+        &["tool", ""][..],
+        &["tool", "--tag", ""][..],
+        &["tool", "--tag="][..],
+        &["tool", "--tag", "r"][..],
+        &["tool", "--tag=r"][..],
+        &["tool", "--tag", "red,"][..],
+        &["tool", "--tag=red,"][..],
+        &["tool", "run", ""][..],
+        &["tool", "run", "j"][..],
+    ] {
+        let mut fresh = external_tool_cmd();
+        assert_eq!(
+            candidate_metadata(complete_external_tool_with(&mut cmd, args)),
+            candidate_metadata(complete_external_tool_with(&mut fresh, args)),
+            "reused command diverged for {args:?}"
+        );
+    }
+
+    // The scope boundaries survive reuse: run-level values stay out of the
+    // root, and root tag values stay out of the run level.
+    assert_eq!(
+        complete_external_tool_with(&mut cmd, &["tool", "run", ""])
+            .iter()
+            .map(|c| c.get_value().to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+        ["job", "log"]
+    );
+    assert_eq!(
+        complete_external_tool_with(&mut cmd, &["tool", ""])
+            .iter()
+            .map(|c| c.get_value().to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+        ["run", "--tag"]
+    );
+}
+
 fn complete(cmd: &mut Command, args: impl AsRef<str>, current_dir: Option<&Path>) -> String {
     let input = args.as_ref();
     let mut args = vec![std::ffi::OsString::from(cmd.get_name())];
