@@ -49,13 +49,14 @@ pub fn complete(
             "complete::next: arg={:?}, current_state={current_state:?}, cursor={cursor:?}",
             arg.to_value_os(),
         );
-        if let ParseState::Opt((opt, _)) = &current_state {
+        if let ParseState::Opt(state) = &current_state {
             // A value terminator ends a multi-value option regardless of the
             // word's shape: unlike a flag-like word, it never starts a new
             // argument, and unlike any other word, it is never one of the
             // option's values. A flag-shaped terminator only wins over flag
             // parsing when the option accepts hyphen values, matching the
             // parser's precedence.
+            let opt = state.opt;
             if is_value_terminator(opt, &arg)
                 && (opt.is_allow_hyphen_values_set() || !is_flag_like(&arg))
             {
@@ -106,6 +107,26 @@ pub fn complete(
             }
         }
 
+        // A strict delimited group whose previous word opened another fragment
+        // (a trailing delimiter) or went invalid owns the next word outright: a
+        // flag, the `--` escape, or a subcommand name is then another value of
+        // the group, never a scope switch. A continuation word that fills the
+        // group closes it; otherwise the group stays pending for its remaining
+        // fragments.
+        if let ParseState::Opt(state) = &current_state {
+            if state.is_strict_group() && (state.open || state.invalid) {
+                let mut state = state.clone();
+                state.observe(arg.to_value_os(), false);
+                next_state =
+                    if !state.invalid && !state.open && state.used.len() == state.capacity() {
+                        ParseState::ValueDone
+                    } else {
+                        ParseState::Opt(state)
+                    };
+                continue;
+            }
+        }
+
         if is_escaped {
             (next_state, pos_index) =
                 parse_positional(current_cmd, pos_index, is_escaped, current_state);
@@ -123,7 +144,10 @@ pub fn complete(
             }
         } else if opt_allows_hyphen(&current_state, &arg) {
             match current_state {
-                ParseState::Opt((opt, count)) => next_state = parse_opt_value(opt, count),
+                ParseState::Opt(mut state) => {
+                    state.observe(arg.to_value_os(), false);
+                    next_state = state.finish();
+                }
                 _ => unreachable!("else branch is only reachable in Opt state"),
             }
         } else if let Some((flag, value)) = arg.to_long() {
@@ -139,11 +163,11 @@ pub fn complete(
                         // state as completing after `--opt value`.
                         // An empty attached value (`--opt=`) types no value
                         // yet, so the option stays pending.
-                        let count = value
-                            .filter(|v| !v.is_empty())
-                            .map(|v| attached_value_count(opt, v))
-                            .unwrap_or(0);
-                        next_state = parse_opt_value(opt, count);
+                        let mut state = OptState::new(opt);
+                        if let Some(value) = value.filter(|v| !v.is_empty()) {
+                            state.observe(value, true);
+                        }
+                        next_state = state.finish();
                     };
                 } else if pos_allows_hyphen(current_cmd, pos_index) {
                     (next_state, pos_index) =
@@ -161,13 +185,15 @@ pub fn complete(
                 // option's values just like a space-separated one. An empty
                 // attached value (`-o=`) types no value yet, so the option
                 // stays pending instead of being treated as satisfied.
-                let count = short
+                let mut state = OptState::new(opt);
+                if let Some(value) = short
                     .next_value_os()
                     .map(|v| v.strip_prefix("=").unwrap_or(v))
                     .filter(|v| !v.is_empty())
-                    .map(|v| attached_value_count(opt, v))
-                    .unwrap_or(0);
-                next_state = parse_opt_value(opt, count);
+                {
+                    state.observe(value, true);
+                }
+                next_state = state.finish();
             } else if pos_allows_hyphen(current_cmd, pos_index) {
                 (next_state, pos_index) =
                     parse_positional(current_cmd, pos_index, is_escaped, current_state);
@@ -178,7 +204,10 @@ pub fn complete(
                     (next_state, pos_index) =
                         parse_positional(current_cmd, pos_index, is_escaped, current_state);
                 }
-                ParseState::Opt((opt, count)) => next_state = parse_opt_value(opt, count),
+                ParseState::Opt(mut state) => {
+                    state.observe(arg.to_value_os(), false);
+                    next_state = state.finish();
+                }
             }
         }
     }
@@ -195,7 +224,231 @@ enum ParseState<'a> {
     Pos((usize, usize)),
 
     /// Parsing a optional flag argument
-    Opt((&'a clap::Arg, usize)),
+    Opt(OptState<'a>),
+}
+
+/// State kept while the values of an option are still being parsed.
+#[derive(Debug, PartialEq, Eq, Clone)]
+struct OptState<'a> {
+    opt: &'a clap::Arg,
+    /// Shell-word values consumed, counted the way the parser does so that
+    /// [`ArgValueCompleter::complete_at`] keeps indexing shell arguments
+    /// rather than delimiter-separated fragments.
+    words: usize,
+    /// Canonical possible-value names of the valid, committed fragments of
+    /// the current occurrence. Only populated for strict delimited groups.
+    used: Vec<String>,
+    /// Whether the most recent shell word ended with the value delimiter, so
+    /// the word under the cursor is still filling this group (and may not
+    /// switch scope no matter how it is shaped).
+    open: bool,
+    /// Whether a committed fragment of the current group was invalid (empty,
+    /// unknown, duplicated, or past the group's capacity). Such a group stays
+    /// locked on value completion and never yields candidates or lets a later
+    /// word switch scope.
+    invalid: bool,
+}
+
+impl<'a> OptState<'a> {
+    fn new(opt: &'a clap::Arg) -> Self {
+        Self {
+            opt,
+            words: 0,
+            used: Vec::new(),
+            open: false,
+            invalid: false,
+        }
+    }
+
+    fn is_strict_group(&self) -> bool {
+        is_strict_group_arg(self.opt)
+    }
+
+    /// Maximum number of values the option accepts; for strict delimited
+    /// groups this is the number of fragments allowed in one occurrence.
+    fn capacity(&self) -> usize {
+        self.opt.get_num_args().expect("built").max_values()
+    }
+
+    /// Record a shell word as a value of this option.
+    ///
+    /// `attached` marks a value glued to its flag (`--opt=a,b`). For options
+    /// whose delimiter is not a strict group, such a word counts every
+    /// delimiter-separated fragment toward the value range; a space-separated
+    /// word counts once. For strict groups the fragments are instead validated
+    /// into `used`, except the empty slot still being typed after a trailing
+    /// delimiter.
+    fn observe(&mut self, word: &OsStr, attached: bool) {
+        if !self.is_strict_group() {
+            let count = if attached {
+                attached_value_count(self.opt, word)
+            } else {
+                1
+            };
+            self.words += count;
+            return;
+        }
+
+        self.words += 1;
+        if self.invalid {
+            return;
+        }
+        let delimiter = self.opt.get_value_delimiter().expect("strict group");
+        let capacity = self.capacity();
+        self.open = word.to_string_lossy().ends_with(delimiter);
+        let Some(word) = word.to_str() else {
+            self.invalid = true;
+            return;
+        };
+        let mut fragments = word.split(delimiter);
+        if self.open {
+            // A trailing delimiter opens the slot still being typed, so its
+            // empty fragment is not a committed value.
+            fragments.next_back();
+        }
+        for fragment in fragments {
+            if self.used.len() >= capacity {
+                self.invalid = true;
+                break;
+            }
+            match canonical_possible_value(self.opt, fragment) {
+                Some(name) if !self.used.contains(&name) => self.used.push(name),
+                _ => {
+                    // Empty (also a doubled delimiter), unknown, or duplicated
+                    // fragment: the parser would reject this group.
+                    self.invalid = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Consume a value and return the state parsing should resume with.
+    ///
+    /// The delimiter separates several fragments within one shell word, so a
+    /// word that does not end with the delimiter is a complete value group and
+    /// ordinary parsing resumes on the next word. A trailing delimiter instead
+    /// opens a fragment still being typed, and an invalid committed fragment
+    /// cannot be salvaged; both keep the group locked on values. An empty
+    /// attached value (`--opt=`) leaves the option waiting for its first value.
+    fn finish(self) -> ParseState<'a> {
+        if self.is_strict_group() {
+            if self.words == 0 || self.invalid || self.open {
+                ParseState::Opt(self)
+            } else {
+                ParseState::ValueDone
+            }
+        } else if self.words >= self.capacity() {
+            ParseState::ValueDone
+        } else {
+            ParseState::Opt(self)
+        }
+    }
+}
+
+/// Whether an option's values form a delimited group that can hold more than
+/// one fragment and whose fragments are validated while typed.
+///
+/// Single-value options (a maximum of one) are excluded: their delimiter only
+/// joins several suggestions into one word, so completed fragments are not
+/// validated against each other.
+fn is_strict_group_arg(arg: &clap::Arg) -> bool {
+    arg.get_value_delimiter().is_some()
+        && arg.get_num_args().expect("built").max_values() > 1
+        && possible_values(arg).is_some()
+}
+
+/// The canonical possible-value name for `fragment`, honoring aliases and the
+/// argument's case-insensitivity, or `None` when it is not a legal value.
+fn canonical_possible_value(arg: &clap::Arg, fragment: &str) -> Option<String> {
+    let ignore_case = arg.is_ignore_case_set();
+    possible_values(arg)?
+        .find(|value| value.matches(fragment, ignore_case))
+        .map(|value| value.get_name().to_owned())
+}
+
+/// Complete the word under the cursor for a strict delimited group.
+///
+/// Fragments already committed in earlier shell words are read from `state`;
+/// fragments committed within the word under the cursor are validated here.
+/// The fragment still being typed is matched against the possible values, and
+/// every suggestion keeps the typed prefix (prior fragments and delimiters).
+/// Any empty, unknown, duplicated, or over-capacity fragment yields an empty
+/// result.
+fn complete_strict_group(cursor: &str, state: &OptState<'_>) -> Vec<CompletionCandidate> {
+    debug!(
+        "complete_strict_group: arg={:?}, cursor={cursor:?}, used={:?}, invalid={}",
+        state.opt.get_id(),
+        state.used,
+        state.invalid
+    );
+    if state.invalid {
+        return Vec::new();
+    }
+    let delimiter = state.opt.get_value_delimiter().expect("strict group");
+    let capacity = state.capacity();
+
+    let ends_with_delimiter = cursor.ends_with(delimiter);
+    let mut parts = cursor.split(delimiter);
+    let typed = if ends_with_delimiter {
+        // The cursor sits right after a delimiter: the trailing empty element
+        // is the fresh fragment being typed, not a committed value.
+        parts.next_back();
+        ""
+    } else {
+        parts.next_back().unwrap_or("")
+    };
+
+    let mut used = state.used.clone();
+    for fragment in parts {
+        if used.len() >= capacity {
+            return Vec::new();
+        }
+        match canonical_possible_value(state.opt, fragment) {
+            Some(name) if !used.contains(&name) => used.push(name),
+            _ => return Vec::new(),
+        }
+    }
+
+    if used.len() >= capacity {
+        // Every slot is taken; there is no room for another fragment.
+        return Vec::new();
+    }
+
+    // Retain the text typed before the current fragment, including the last
+    // delimiter, so suggestions replace only the fragment under the cursor.
+    let prefix = cursor
+        .rfind(delimiter)
+        .map(|pos| cursor[..pos + delimiter.len_utf8()].to_owned());
+
+    let possible = possible_values(state.opt).expect("strict group");
+    let mut values = complete_candidates_str(typed, possible_value_candidates(possible));
+    // A value already committed to the group cannot be repeated.
+    values.retain(|candidate| {
+        candidate
+            .get_value()
+            .to_str()
+            .is_none_or(|name| !used.iter().any(|used| used == name))
+    });
+
+    if let Some(prefix) = prefix {
+        values = values
+            .into_iter()
+            .map(|comp| comp.add_prefix(prefix.clone()))
+            .collect();
+    }
+    values = values
+        .into_iter()
+        .map(|comp| {
+            if comp.get_tag().is_some() {
+                comp
+            } else {
+                comp.tag(Some(state.opt.to_string().into()))
+            }
+        })
+        .collect();
+
+    values
 }
 
 fn complete_arg(
@@ -254,27 +507,39 @@ fn complete_arg(
                 }
             }
         }
-        ParseState::Opt((opt, count)) => {
-            completions.extend(complete_arg_value(
-                arg.to_value(),
-                opt,
-                current_dir,
-                count.saturating_sub(1),
-            ));
-            let min = opt.get_num_args().map(|r| r.min_values()).unwrap_or(0);
-            if count > min && can_switch_to_other_arg(opt, arg) {
-                // The option's required values are satisfied and this word
-                // would be parsed as a new flag rather than another value, so
-                // also complete it as a positional, flag, option or subcommand.
-                completions.extend(complete_arg(
-                    arg,
-                    cmd,
+        ParseState::Opt(state) => {
+            if state.is_strict_group() {
+                // Every word belongs to the pending delimited group until it is
+                // complete; it is never an option, positional, or subcommand.
+                if let Ok(cursor) = arg.to_value() {
+                    completions.extend(complete_strict_group(cursor, &state));
+                }
+            } else {
+                let opt = state.opt;
+                // `words` counts already-consumed values; the word under the
+                // cursor is the next one, so the option sees one more value.
+                let count = state.words + 1;
+                completions.extend(complete_arg_value(
+                    arg.to_value(),
+                    opt,
                     current_dir,
-                    pos_index,
-                    is_escaped,
-                    ParseState::ValueDone,
-                    used_args,
-                )?);
+                    count.saturating_sub(1),
+                ));
+                let min = opt.get_num_args().map(|r| r.min_values()).unwrap_or(0);
+                if count > min && can_switch_to_other_arg(opt, arg) {
+                    // The option's required values are satisfied and this word
+                    // would be parsed as a new flag rather than another value, so
+                    // also complete it as a positional, flag, option or subcommand.
+                    completions.extend(complete_arg(
+                        arg,
+                        cmd,
+                        current_dir,
+                        pos_index,
+                        is_escaped,
+                        ParseState::ValueDone,
+                        used_args,
+                    )?);
+                }
             }
         }
     }
@@ -345,11 +610,26 @@ fn complete_option(
         if let Ok(flag) = flag {
             if let Some(value) = value {
                 if let Some(arg) = cmd.get_arguments().find(|a| is_long_match(a, flag)) {
-                    completions.extend(
-                        complete_arg_value(value.to_str().ok_or(value), arg, current_dir, 0)
-                            .into_iter()
-                            .map(|comp| comp.add_prefix(format!("--{flag}="))),
-                    );
+                    if is_strict_group_arg(arg) {
+                        // The whole attached word is the delimited group being
+                        // typed, so its committed fragments are validated in
+                        // place and only the fragment after the last delimiter
+                        // is offered; the flag spelling is re-prefixed below.
+                        if let Some(value) = value.to_str() {
+                            let state = OptState::new(arg);
+                            completions.extend(
+                                complete_strict_group(value, &state)
+                                    .into_iter()
+                                    .map(|comp| comp.add_prefix(format!("--{flag}="))),
+                            );
+                        }
+                    } else {
+                        completions.extend(
+                            complete_arg_value(value.to_str().ok_or(value), arg, current_dir, 0)
+                                .into_iter()
+                                .map(|comp| comp.add_prefix(format!("--{flag}="))),
+                        );
+                    }
                 }
             } else {
                 completions.extend(
@@ -380,14 +660,18 @@ fn complete_option(
                 };
 
                 let value = short.next_value_os().unwrap_or(OsStr::new(""));
-                completions.extend(
+                let group_completions = if is_strict_group_arg(opt) {
+                    value
+                        .to_str()
+                        .map(|value| complete_strict_group(value, &OptState::new(opt)))
+                        .unwrap_or_default()
+                } else {
                     complete_arg_value(value.to_str().ok_or(value), opt, current_dir, 0)
-                        .into_iter()
-                        .map(|comp| {
-                            let sep = if has_equal { "=" } else { "" };
-                            comp.add_prefix(format!("-{leading_flags}{sep}"))
-                        }),
-                );
+                };
+                completions.extend(group_completions.into_iter().map(|comp| {
+                    let sep = if has_equal { "=" } else { "" };
+                    comp.add_prefix(format!("-{leading_flags}{sep}"))
+                }));
             } else {
                 completions.extend(
                     shorts_and_visible_aliases(cmd)
@@ -908,15 +1192,11 @@ fn parse_positional<'a>(
     }
 }
 
-/// Parse optional flag argument. Return new state
-fn parse_opt_value(opt: &clap::Arg, count: usize) -> ParseState<'_> {
-    let range = opt.get_num_args().expect("built");
-    let max = range.max_values();
-    if count < max {
-        ParseState::Opt((opt, count + 1))
-    } else {
-        ParseState::ValueDone
-    }
+fn pos_allows_hyphen(cmd: &clap::Command, pos_index: usize) -> bool {
+    cmd.get_positionals()
+        .find(|a| a.get_index() == Some(pos_index))
+        .map(|p| p.is_allow_hyphen_values_set())
+        .unwrap_or(false)
 }
 
 /// How many of an option's values an attached `=value` (or `-ovalue`) accounts
@@ -928,18 +1208,11 @@ fn attached_value_count(opt: &clap::Arg, value: &OsStr) -> usize {
     }
 }
 
-fn pos_allows_hyphen(cmd: &clap::Command, pos_index: usize) -> bool {
-    cmd.get_positionals()
-        .find(|a| a.get_index() == Some(pos_index))
-        .map(|p| p.is_allow_hyphen_values_set())
-        .unwrap_or(false)
-}
-
 fn opt_allows_hyphen(state: &ParseState<'_>, arg: &clap_lex::ParsedArg<'_>) -> bool {
     let val = arg.to_value_os();
     if val.starts_with("-") {
-        if let ParseState::Opt((opt, _)) = state {
-            return opt.is_allow_hyphen_values_set();
+        if let ParseState::Opt(state) = state {
+            return state.opt.is_allow_hyphen_values_set();
         }
     }
 
