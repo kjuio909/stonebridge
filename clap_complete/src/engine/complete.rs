@@ -49,6 +49,25 @@ pub fn complete(
             "complete::next: arg={:?}, current_state={current_state:?}, cursor={cursor:?}",
             arg.to_value_os(),
         );
+        if let ParseState::DelimOpt { opt, used, valid } = &current_state {
+            // A delimiter-separated value group is open: the word is another
+            // raw segment of the group, never a flag, `--` terminator,
+            // positional, or subcommand.
+            if cursor == target_cursor {
+                let mut completions = if *valid {
+                    match arg.to_value() {
+                        Ok(word) => complete_delimited_values(opt, used, word),
+                        Err(_) => Vec::new(),
+                    }
+                } else {
+                    Vec::new()
+                };
+                finalize_completions(&mut completions, current_cmd, &used_args, arg.is_empty());
+                return Ok(completions);
+            }
+            next_state = advance_delim_group(opt, used.clone(), *valid, &arg);
+            continue;
+        }
         if let ParseState::Opt((opt, _)) = &current_state {
             // A value terminator ends a multi-value option regardless of the
             // word's shape: unlike a flag-like word, it never starts a new
@@ -139,11 +158,17 @@ pub fn complete(
                         // state as completing after `--opt value`.
                         // An empty attached value (`--opt=`) types no value
                         // yet, so the option stays pending.
-                        let count = value
-                            .filter(|v| !v.is_empty())
-                            .map(|v| attached_value_count(opt, v))
-                            .unwrap_or(0);
-                        next_state = parse_opt_value(opt, count);
+                        next_state = match value.filter(|v| !v.is_empty()) {
+                            Some(v) => {
+                                let count = attached_value_count(opt, v);
+                                match v.to_str() {
+                                    Some(text) => open_delim_group(opt, text)
+                                        .unwrap_or_else(|| parse_opt_value(opt, count)),
+                                    None => parse_opt_value(opt, count),
+                                }
+                            }
+                            None => parse_opt_value(opt, 0),
+                        };
                     };
                 } else if pos_allows_hyphen(current_cmd, pos_index) {
                     (next_state, pos_index) =
@@ -161,13 +186,21 @@ pub fn complete(
                 // option's values just like a space-separated one. An empty
                 // attached value (`-o=`) types no value yet, so the option
                 // stays pending instead of being treated as satisfied.
-                let count = short
+                next_state = match short
                     .next_value_os()
                     .map(|v| v.strip_prefix("=").unwrap_or(v))
                     .filter(|v| !v.is_empty())
-                    .map(|v| attached_value_count(opt, v))
-                    .unwrap_or(0);
-                next_state = parse_opt_value(opt, count);
+                {
+                    Some(v) => {
+                        let count = attached_value_count(opt, v);
+                        match v.to_str() {
+                            Some(text) => open_delim_group(opt, text)
+                                .unwrap_or_else(|| parse_opt_value(opt, count)),
+                            None => parse_opt_value(opt, count),
+                        }
+                    }
+                    None => parse_opt_value(opt, 0),
+                };
             } else if pos_allows_hyphen(current_cmd, pos_index) {
                 (next_state, pos_index) =
                     parse_positional(current_cmd, pos_index, is_escaped, current_state);
@@ -178,7 +211,16 @@ pub fn complete(
                     (next_state, pos_index) =
                         parse_positional(current_cmd, pos_index, is_escaped, current_state);
                 }
-                ParseState::Opt((opt, count)) => next_state = parse_opt_value(opt, count),
+                ParseState::Opt((opt, count)) => {
+                    next_state = match arg.to_value() {
+                        Ok(text) => open_delim_group(opt, text)
+                            .unwrap_or_else(|| parse_opt_value(opt, count)),
+                        Err(_) => parse_opt_value(opt, count),
+                    };
+                }
+                ParseState::DelimOpt { .. } => {
+                    unreachable!("open delimiter groups are consumed at the top of the loop")
+                }
             }
         }
     }
@@ -196,6 +238,23 @@ enum ParseState<'a> {
 
     /// Parsing a optional flag argument
     Opt((&'a clap::Arg, usize)),
+
+    /// Parsing an option whose delimiter-separated value group is still open.
+    ///
+    /// The group opens when a value word ends with the option's value
+    /// delimiter (e.g. `--tag red,`). Until a word closes it, every following
+    /// word is another raw segment of the group — never a flag, a `--`
+    /// terminator, a positional, or a subcommand — so completion cannot switch
+    /// levels mid-group.
+    ///
+    /// `used` holds the canonical names of every already committed segment;
+    /// `valid` is `false` once a committed segment failed validation (empty,
+    /// unknown, or repeated).
+    DelimOpt {
+        opt: &'a clap::Arg,
+        used: Vec<String>,
+        valid: bool,
+    },
 }
 
 fn complete_arg(
@@ -231,6 +290,7 @@ fn complete_arg(
                     positional,
                     current_dir,
                     0,
+                    &[],
                 ));
             }
             if !is_escaped {
@@ -244,6 +304,7 @@ fn complete_arg(
                     positional,
                     current_dir,
                     num_arg.saturating_sub(1),
+                    &[],
                 ));
                 if !is_escaped
                     && positional
@@ -260,6 +321,7 @@ fn complete_arg(
                 opt,
                 current_dir,
                 count.saturating_sub(1),
+                &[],
             ));
             let min = opt.get_num_args().map(|r| r.min_values()).unwrap_or(0);
             if count > min && can_switch_to_other_arg(opt, arg) {
@@ -277,15 +339,31 @@ fn complete_arg(
                 )?);
             }
         }
+        ParseState::DelimOpt { .. } => {
+            unreachable!("open delimiter groups are completed directly in `complete`")
+        }
     }
-    filter_unavailable_args(&mut completions, cmd, used_args);
+    finalize_completions(&mut completions, cmd, used_args, arg.is_empty());
+
+    Ok(completions)
+}
+
+/// Apply the shared filtering, hidden, de-duplication and ordering rules to a
+/// raw set of candidates.
+fn finalize_completions(
+    completions: &mut Vec<CompletionCandidate>,
+    cmd: &clap::Command,
+    used_args: &[clap::Id],
+    empty_word: bool,
+) {
+    filter_unavailable_args(completions, cmd, used_args);
     if completions.iter().any(|a| !a.is_hide_set()) {
         completions.retain(|a| !a.is_hide_set());
     }
-    dedup_argument_candidates(&mut completions, arg.is_empty());
+    dedup_argument_candidates(completions, empty_word);
 
     let mut tags = Vec::new();
-    for candidate in &completions {
+    for candidate in &*completions {
         let tag = candidate.get_tag().cloned();
         if !tags.contains(&tag) {
             tags.push(tag);
@@ -297,8 +375,6 @@ fn complete_arg(
             c.get_display_order(),
         )
     });
-
-    Ok(completions)
 }
 
 fn complete_option(
@@ -346,7 +422,7 @@ fn complete_option(
             if let Some(value) = value {
                 if let Some(arg) = cmd.get_arguments().find(|a| is_long_match(a, flag)) {
                     completions.extend(
-                        complete_arg_value(value.to_str().ok_or(value), arg, current_dir, 0)
+                        complete_arg_value(value.to_str().ok_or(value), arg, current_dir, 0, &[])
                             .into_iter()
                             .map(|comp| comp.add_prefix(format!("--{flag}="))),
                     );
@@ -381,7 +457,7 @@ fn complete_option(
 
                 let value = short.next_value_os().unwrap_or(OsStr::new(""));
                 completions.extend(
-                    complete_arg_value(value.to_str().ok_or(value), opt, current_dir, 0)
+                    complete_arg_value(value.to_str().ok_or(value), opt, current_dir, 0, &[])
                         .into_iter()
                         .map(|comp| {
                             let sep = if has_equal { "=" } else { "" };
@@ -406,9 +482,32 @@ fn complete_arg_value(
     arg: &clap::Arg,
     current_dir: Option<&std::path::Path>,
     arg_index: usize,
+    used: &[String],
 ) -> Vec<CompletionCandidate> {
     let mut values = Vec::new();
-    debug!("complete_arg_value: arg={arg:?}, value={value:?}, arg_index={arg_index:?}");
+    debug!(
+        "complete_arg_value: arg={arg:?}, value={value:?}, arg_index={arg_index:?}, used={used:?}"
+    );
+
+    // A repeatable option with a value delimiter and a fixed value set (for
+    // example `--tag red,green,`) completes one delimiter-separated group:
+    // every committed segment must be a distinct accepted value, and only the
+    // values not used yet are offered for the segment being typed.
+    if let (Some(delimiter), Ok(text)) = (arg.get_value_delimiter(), value) {
+        if is_repeated_delimited_value_arg(arg) {
+            if let Some(possible) = possible_values(arg) {
+                let possible: Vec<_> = possible.collect();
+                let values = complete_grouped_possible_values(
+                    text,
+                    delimiter,
+                    &possible,
+                    arg.is_ignore_case_set(),
+                    used,
+                );
+                return tag_value_candidates(values, arg);
+            }
+        }
+    }
 
     let (prefix, value) =
         rsplit_delimiter(value, arg.get_value_delimiter()).unwrap_or((None, value));
@@ -474,7 +573,29 @@ fn complete_arg_value(
             .map(|comp| comp.add_prefix(prefix))
             .collect();
     }
-    values = values
+    tag_value_candidates(values, arg)
+}
+
+/// Whether `arg` is a repeatable option whose values are grouped by a
+/// delimiter (for example a repeatable `--tag` taking `red,green,blue`).
+///
+/// Such an option completes a delimiter-separated group as a whole: within a
+/// group every segment must be a distinct accepted value, a trailing
+/// delimiter keeps the group open for another segment, and only the accepted
+/// values not used yet are offered. Single-occurrence (`Set`) arguments and
+/// positional arguments keep their historical completion behavior.
+fn is_repeated_delimited_value_arg(arg: &clap::Arg) -> bool {
+    arg.get_index().is_none()
+        && matches!(*arg.get_action(), clap::ArgAction::Append)
+        && arg.get_value_delimiter().is_some()
+}
+
+/// Tag candidates belonging to `arg`, preserving any pre-existing tag.
+fn tag_value_candidates(
+    values: Vec<CompletionCandidate>,
+    arg: &clap::Arg,
+) -> Vec<CompletionCandidate> {
+    values
         .into_iter()
         .map(|comp| {
             if comp.get_tag().is_some() {
@@ -483,10 +604,220 @@ fn complete_arg_value(
                 comp.tag(Some(arg.to_string().into()))
             }
         })
-        .collect();
+        .collect()
+}
 
-    debug!("complete_arg_value: values={values:?}");
-    values
+/// The canonical accepted value equal to `segment`, honoring aliases and
+/// case-insensitivity, or `None` when the segment is not accepted.
+fn canonical_segment(
+    segment: &str,
+    possible: &[clap::builder::PossibleValue],
+    ignore_case: bool,
+) -> Option<String> {
+    possible
+        .iter()
+        .find(|pv| pv.matches(segment, ignore_case))
+        .map(|pv| pv.get_name().to_owned())
+}
+
+/// Complete the segment currently being typed within a delimiter-separated
+/// value group.
+///
+/// `text` is the whole current shell word and `prior_used` the canonical
+/// values committed by earlier words of the same open group. Every committed
+/// segment must be non-empty, accepted, and distinct; otherwise completion is
+/// an empty set. Candidates carry the word's verbatim prefix (up to and
+/// including its last delimiter), preserving typed text.
+fn complete_grouped_possible_values(
+    text: &str,
+    delimiter: char,
+    possible: &[clap::builder::PossibleValue],
+    ignore_case: bool,
+    prior_used: &[String],
+) -> Vec<CompletionCandidate> {
+    debug!(
+        "complete_grouped_possible_values: text={text:?}, delimiter={delimiter:?}, prior_used={prior_used:?}"
+    );
+
+    let mut segments = text.split(delimiter);
+    let last = segments.next_back().unwrap_or("");
+    let committed = segments;
+
+    let mut used: Vec<String> = prior_used.to_vec();
+    for segment in committed {
+        match canonical_segment(segment, possible, ignore_case) {
+            Some(canonical) if !used.contains(&canonical) => used.push(canonical),
+            // An empty, unknown, or repeated segment makes the group invalid:
+            // never offer candidates that could mask the mistake.
+            _ => return Vec::new(),
+        }
+    }
+
+    // The verbatim typed prefix, ending with the delimiter, if any.
+    let prefix = text
+        .rfind(delimiter)
+        .map(|pos| text.split_at(pos + delimiter.len_utf8()).0)
+        .unwrap_or("");
+
+    possible
+        .iter()
+        .filter(|pv| !used.iter().any(|used| used == pv.get_name()))
+        .filter(|pv| pv.get_name().starts_with(last))
+        .map(|pv| {
+            let candidate = CompletionCandidate::new(OsString::from(pv.get_name()))
+                .help(pv.get_help().cloned())
+                .hide(pv.is_hide_set());
+            if prefix.is_empty() {
+                candidate
+            } else {
+                candidate.add_prefix(prefix)
+            }
+        })
+        .collect()
+}
+
+/// Open a delimiter-separated value group for a previously seen value word of
+/// a repeatable delimited option.
+///
+/// Returns `None` when the option is not a repeatable delimited option, or the
+/// word is a complete, valid group by itself (every segment is a distinct
+/// accepted value and the word does not end with the delimiter): such a word
+/// closes the group and ordinary parsing resumes. Any other word — one ending
+/// with the delimiter, or one containing an empty, unknown, or repeated
+/// segment — keeps the group open; an invalid segment flips `valid` to
+/// `false`, so the group neither offers candidates nor accepts a level switch.
+fn open_delim_group<'a>(opt: &'a clap::Arg, text: &str) -> Option<ParseState<'a>> {
+    if !is_repeated_delimited_value_arg(opt) {
+        return None;
+    }
+    let delimiter = opt.get_value_delimiter()?;
+    // A word with no delimiter is a single value, not a delimiter-separated
+    // group: leave it to the ordinary option-value path so an invalid single
+    // value neither keeps the option pending nor changes later completion.
+    if !text.contains(delimiter) {
+        return None;
+    }
+    let possible: Vec<_> = possible_values(opt)?.collect();
+
+    let continues = text.ends_with(delimiter);
+    let mut segments = text.split(delimiter);
+    // When continuing, the final empty segment (after the trailing delimiter)
+    // is still pending rather than a committed value.
+    if continues {
+        segments.next_back();
+    }
+    let committed = segments;
+
+    let mut used = Vec::new();
+    let mut valid = true;
+    for segment in committed {
+        match canonical_segment(segment, &possible, opt.is_ignore_case_set()) {
+            Some(canonical) if !used.contains(&canonical) => used.push(canonical),
+            _ => valid = false,
+        }
+    }
+
+    if valid && !continues {
+        // A complete, valid group closes the option.
+        None
+    } else {
+        Some(ParseState::DelimOpt { opt, used, valid })
+    }
+}
+
+/// Advance an open delimiter-separated group past a previously seen word.
+///
+/// A word ending with the delimiter extends the group; any other word only
+/// closes it when it is itself a complete, accepted, unused final segment.
+/// Flag-like words, `--`, subcommand names, or unknown words never close the
+/// group or switch levels — they are failed segments of the still-open group.
+fn advance_delim_group<'a>(
+    opt: &'a clap::Arg,
+    used: Vec<String>,
+    valid: bool,
+    arg: &clap_lex::ParsedArg<'_>,
+) -> ParseState<'a> {
+    let delimiter = match opt.get_value_delimiter() {
+        Some(delimiter) => delimiter,
+        None => return ParseState::ValueDone,
+    };
+    let text = match arg.to_value() {
+        Ok(text) => text,
+        // A non-UTF-8 word cannot be an accepted value; keep the group open
+        // but invalid rather than switching levels.
+        Err(_) => {
+            return ParseState::DelimOpt {
+                opt,
+                used,
+                valid: false,
+            };
+        }
+    };
+
+    let possible: Vec<_> = match possible_values(opt) {
+        Some(possible) => possible.collect(),
+        None => return ParseState::ValueDone,
+    };
+
+    let continues = text.ends_with(delimiter);
+    let mut segments = text.split(delimiter);
+    let last = segments.next_back().unwrap_or("");
+    let committed = segments;
+
+    let mut new_used = used;
+    let mut committed_valid = valid;
+    for segment in committed {
+        match canonical_segment(segment, &possible, opt.is_ignore_case_set()) {
+            Some(canonical) if !new_used.contains(&canonical) => new_used.push(canonical),
+            _ => committed_valid = false,
+        }
+    }
+
+    if continues {
+        ParseState::DelimOpt {
+            opt,
+            used: new_used,
+            valid: committed_valid,
+        }
+    } else {
+        // A non-continuing word closes the group only when every segment is
+        // valid and its final segment is a complete, unused accepted value.
+        let completes = committed_valid
+            && canonical_segment(last, &possible, opt.is_ignore_case_set())
+                .is_some_and(|canonical| !new_used.contains(&canonical));
+        if completes {
+            ParseState::ValueDone
+        } else {
+            ParseState::DelimOpt {
+                opt,
+                used: new_used,
+                valid: false,
+            }
+        }
+    }
+}
+
+/// Complete the current word of an open delimiter-separated group.
+fn complete_delimited_values(
+    opt: &clap::Arg,
+    used: &[String],
+    word: &str,
+) -> Vec<CompletionCandidate> {
+    let Some(delimiter) = opt.get_value_delimiter() else {
+        return Vec::new();
+    };
+    let Some(possible) = possible_values(opt) else {
+        return Vec::new();
+    };
+    let possible: Vec<_> = possible.collect();
+    let values = complete_grouped_possible_values(
+        word,
+        delimiter,
+        &possible,
+        opt.is_ignore_case_set(),
+        used,
+    );
+    tag_value_candidates(values, opt)
 }
 
 fn rsplit_delimiter<'s, 'o>(
@@ -901,7 +1232,7 @@ fn parse_positional<'a>(
                 update_state_with_new_positional(pos_index)
             }
         }
-        ParseState::Opt(..) => unreachable!(
+        ParseState::Opt(..) | ParseState::DelimOpt { .. } => unreachable!(
             "This branch won't be hit,
             because ParseState::Opt should not be seen as a positional argument and passed to this function."
         ),

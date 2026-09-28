@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Fixes
 
 - *(dynamic)* Respect `Arg::value_terminator`, completing an option's values until its terminator and resuming ordinary completion afterwards
+- *(dynamic)* Complete repeatable, delimiter-separated option values one segment at a time: offer only the values not used yet, return an empty set for empty, unknown, or repeated segments, keep the group open across words until it is complete, and only honor `--` once the group is finished
 
 ## [4.6.10] - 2026-09-14
 

@@ -3730,6 +3730,365 @@ fn define_bad_inputs_do_not_pollute_command_state() {
     assert_eq!(values, ["run", "src", "dst", "--define", "--verbose"]);
 }
 
+fn delimited_tag_tool_cmd() -> Command {
+    Command::new("tool")
+        .disable_help_flag(true)
+        .disable_version_flag(true)
+        .disable_help_subcommand(true)
+        .arg(
+            clap::Arg::new("tag")
+                .long("tag")
+                .value_parser([
+                    PossibleValue::new("red").help("Primary color"),
+                    PossibleValue::new("green").help("Mixed color"),
+                    PossibleValue::new("blue").help("Cool color"),
+                ])
+                .value_delimiter(',')
+                .action(clap::ArgAction::Append),
+        )
+        .arg(
+            clap::Arg::new("verbose")
+                .long("verbose")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(clap::Arg::new("src").value_parser(["src", "dst"]))
+        .arg(clap::Arg::new("dst").value_parser(["src", "dst"]))
+        .subcommand(
+            Command::new("run")
+                .disable_help_flag(true)
+                .disable_version_flag(true)
+                .disable_help_subcommand(true)
+                .arg(
+                    clap::Arg::new("tag")
+                        .long("tag")
+                        .value_parser(["job", "log", "tmp"])
+                        .value_delimiter(',')
+                        .action(clap::ArgAction::Append),
+                )
+                .arg(clap::Arg::new("pos").value_parser(["test", "bench"])),
+        )
+}
+
+fn complete_delimited_tag_with(
+    cmd: &mut Command,
+    args: &[&str],
+) -> Vec<CompletionCandidate> {
+    let args: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
+    let arg_index = args.len() - 1;
+    clap_complete::engine::complete(cmd, args, arg_index, None).unwrap()
+}
+
+fn complete_delimited_tag(args: &[&str]) -> Vec<CompletionCandidate> {
+    let mut cmd = delimited_tag_tool_cmd();
+    complete_delimited_tag_with(&mut cmd, args)
+}
+
+fn delimited_tag_values(args: &[&str]) -> Vec<String> {
+    complete_delimited_tag(args)
+        .into_iter()
+        .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+        .collect()
+}
+
+#[test]
+fn delimited_tag_completes_legal_values() {
+    // Starting a tag value, with or without the equals sign, only offers the
+    // legal values.
+    assert_eq!(
+        delimited_tag_values(&["tool", "--tag", ""]),
+        ["red", "green", "blue"]
+    );
+    assert_eq!(
+        delimited_tag_values(&["tool", "--tag="]),
+        ["--tag=red", "--tag=green", "--tag=blue"]
+    );
+    assert_eq!(
+        delimited_tag_values(&["tool", "--tag", "r"]),
+        ["red"]
+    );
+    assert_eq!(
+        delimited_tag_values(&["tool", "--tag=r"]),
+        ["--tag=red"]
+    );
+    assert!(delimited_tag_values(&["tool", "--tag", "z"]).is_empty());
+}
+
+#[test]
+fn delimited_tag_completes_only_new_segment() {
+    // After a comma only the segment after the comma is completed, while the
+    // typed prefix and delimiter are preserved on every candidate.
+    assert_eq!(
+        delimited_tag_values(&["tool", "--tag", "red,"]),
+        ["red,green", "red,blue"]
+    );
+    assert_eq!(
+        delimited_tag_values(&["tool", "--tag", "red,g"]),
+        ["red,green"]
+    );
+    assert_eq!(
+        delimited_tag_values(&["tool", "--tag=red,"]),
+        ["--tag=red,green", "--tag=red,blue"]
+    );
+    assert_eq!(
+        delimited_tag_values(&["tool", "--tag=red,g"]),
+        ["--tag=red,green"]
+    );
+    // A second completed segment leaves only the last remaining value.
+    assert_eq!(
+        delimited_tag_values(&["tool", "--tag", "red,green,"]),
+        ["red,green,blue"]
+    );
+}
+
+#[test]
+fn delimited_tag_rejects_invalid_segments() {
+    // A duplicate, unknown, or empty (consecutive comma) segment is a failed
+    // group: completion is a successful empty set rather than options,
+    // positionals, or subcommands.
+    for args in [
+        &["tool", "--tag", "red,red"][..],
+        &["tool", "--tag", "red,red,"][..],
+        &["tool", "--tag", "red,red,g"][..],
+        &["tool", "--tag", "red,purple"][..],
+        &["tool", "--tag", "red,purple,"][..],
+        &["tool", "--tag", "red,,"][..],
+        &["tool", "--tag", "red,,g"][..],
+        &["tool", "--tag", "red,,green"][..],
+        &["tool", "--tag=red,red,"][..],
+        &["tool", "--tag=red,,g"][..],
+    ] {
+        assert!(
+            delimited_tag_values(args).is_empty(),
+            "expected no candidates for {args:?}, got {:?}",
+            delimited_tag_values(args)
+        );
+    }
+}
+
+#[test]
+fn delimited_tag_limits_group_to_three_segments() {
+    // The group holds at most three segments: a fourth comma or typed segment
+    // yields nothing, even when the prefix itself looks complete.
+    assert!(delimited_tag_values(&["tool", "--tag", "red,green,blue,"]).is_empty());
+    assert!(delimited_tag_values(&["tool", "--tag", "red,green,blue,g"]).is_empty());
+    assert!(delimited_tag_values(&["tool", "--tag", "red,green,blue,red"]).is_empty());
+    assert!(delimited_tag_values(&["tool", "--tag=red,green,blue,"]).is_empty());
+
+    // But the complete three-segment group itself is still offered, and once
+    // the cursor moves past it ordinary root completion resumes.
+    assert_eq!(
+        delimited_tag_values(&["tool", "--tag", "red,green,blue"]),
+        ["red,green,blue"]
+    );
+    assert_eq!(
+        delimited_tag_values(&["tool", "--tag", "red,green,blue", ""]),
+        ["run", "src", "dst", "--tag", "--verbose"]
+    );
+}
+
+#[test]
+fn delimited_tag_stays_in_group_until_completed() {
+    // While the group is pending, flag-like words, the subcommand name, and the
+    // terminator are just another segment: they never switch levels and never
+    // leak other candidates.
+    for word in ["--verbose", "--tag", "--", "-x", "run", "src", "bogus"] {
+        let args = vec!["tool", "--tag", "red,", word];
+        assert!(
+            delimited_tag_values(&args).is_empty(),
+            "word {word:?} must be a tag segment, got {:?}",
+            delimited_tag_values(&args)
+        );
+    }
+    // The same words typed inside the current shell word are segments too.
+    for word in ["--verbose", "--", "-x", "run", "bogus"] {
+        let segment = format!("red,{word}");
+        let args = vec!["tool", "--tag", segment.as_str()];
+        assert!(
+            delimited_tag_values(&args).is_empty(),
+            "in-word {word:?} must be a tag segment, got {:?}",
+            delimited_tag_values(&args)
+        );
+    }
+
+    // A completed group followed by an empty word resumes the root level.
+    assert_eq!(
+        delimited_tag_values(&["tool", "--tag", "red,green", ""]),
+        ["run", "src", "dst", "--tag", "--verbose"]
+    );
+}
+
+#[test]
+fn delimited_tag_terminator_only_after_completed_group() {
+    // Mid-group the terminator is an ordinary (failed) segment.
+    assert!(delimited_tag_values(&["tool", "--tag", "red,", "--"]).is_empty());
+    assert!(delimited_tag_values(&["tool", "--tag", "red,", "--", ""]).is_empty());
+
+    // A completed group accepts `--`, after which only current-level
+    // positionals are completed.
+    assert_eq!(
+        delimited_tag_values(&["tool", "--tag", "red,green", "--", ""]),
+        ["src", "dst"]
+    );
+    assert_eq!(
+        delimited_tag_values(&["tool", "--tag=red,green", "--", "s"]),
+        ["src"]
+    );
+
+    // After the terminator, commas, option-style words, subcommand names, and
+    // unknown words are positional values: successful empty results.
+    for word in [",", "--tag", "--verbose", "run", "red,green", "bogus"] {
+        let args = vec!["tool", "--tag", "red,green", "--", word];
+        assert!(
+            delimited_tag_values(&args).is_empty(),
+            "post-terminator word {word:?} must be empty, got {:?}",
+            delimited_tag_values(&args)
+        );
+    }
+}
+
+#[test]
+fn delimited_tag_run_scope_is_isolated() {
+    // Inside `run` only the run-level legal values are offered.
+    assert_eq!(
+        delimited_tag_values(&["tool", "run", "--tag", ""]),
+        ["job", "log", "tmp"]
+    );
+    assert_eq!(
+        delimited_tag_values(&["tool", "run", "--tag", "job,"]),
+        ["job,log", "job,tmp"]
+    );
+    assert_eq!(
+        delimited_tag_values(&["tool", "run", "--tag=job,l"]),
+        ["--tag=job,log"]
+    );
+
+    // Root-level values neither match nor leak into the run scope.
+    assert!(delimited_tag_values(&["tool", "run", "--tag", "red,"]).is_empty());
+    assert!(delimited_tag_values(&["tool", "run", "--tag", "red,g"]).is_empty());
+
+    // A root value entered before descending does not leak into the run group.
+    assert_eq!(
+        delimited_tag_values(&["tool", "--tag", "red", "run", "--tag", "job,"]),
+        ["job,log", "job,tmp"]
+    );
+
+    // A completed run group resumes run-level positionals and options.
+    assert_eq!(
+        delimited_tag_values(&["tool", "run", "--tag", "job,tmp", ""]),
+        ["test", "bench", "--tag"]
+    );
+    // Pending run groups keep run-level words inside the group.
+    assert!(delimited_tag_values(&["tool", "run", "--tag", "job,", "test"]).is_empty());
+}
+
+#[test]
+fn delimited_tag_repeated_occurrences_are_independent() {
+    // A new occurrence starts a fresh group with the full value set.
+    assert_eq!(
+        delimited_tag_values(&["tool", "--tag", "red", "--tag", ""]),
+        ["red", "green", "blue"]
+    );
+    assert_eq!(
+        delimited_tag_values(&["tool", "--tag", "red,green", "--tag", ""]),
+        ["red", "green", "blue"]
+    );
+    assert_eq!(
+        delimited_tag_values(&["tool", "--tag", "red", "--tag", "blue,"]),
+        ["blue,red", "blue,green"]
+    );
+
+    // The second occurrence cannot start while the first group is still open:
+    // the repeated flag is just another (failed) segment.
+    assert!(delimited_tag_values(&["tool", "--tag", "red,", "--tag", ""]).is_empty());
+    assert!(delimited_tag_values(&["tool", "--tag", "red,", "--tag", "blue,"]).is_empty());
+}
+
+#[test]
+fn delimited_tag_metadata_preserved() {
+    // The grouped candidates must carry the same help, id, tag, ordering, and
+    // hidden state as plain tag-value candidates.
+    let plain: std::collections::HashMap<_, _> = complete_delimited_tag(&["tool", "--tag", ""])
+        .into_iter()
+        .map(|c| (c.get_value().to_string_lossy().into_owned(), c))
+        .collect();
+    let grouped = complete_delimited_tag(&["tool", "--tag", "red,"]);
+    for candidate in grouped {
+        let name = candidate
+            .get_value()
+            .to_string_lossy()
+            .strip_prefix("red,")
+            .unwrap()
+            .to_owned();
+        let baseline = plain.get(&name).expect("baseline candidate exists");
+        assert_eq!(candidate.get_help(), baseline.get_help(), "{name}");
+        assert_eq!(candidate.get_id(), baseline.get_id(), "{name}");
+        assert_eq!(candidate.get_tag(), baseline.get_tag(), "{name}");
+        assert_eq!(
+            candidate.get_display_order(),
+            baseline.get_display_order(),
+            "{name}"
+        );
+        assert_eq!(candidate.is_hide_set(), baseline.is_hide_set(), "{name}");
+    }
+}
+
+#[test]
+fn delimited_tag_invalid_inputs_do_not_pollute_command_state() {
+    // Every malformed line returns Ok, and a later legal call on the same
+    // command object still completes correctly.
+    let mut cmd = delimited_tag_tool_cmd();
+    let bad_lines: &[&[&str]] = &[
+        &["tool", "--tag", "red,red"],
+        &["tool", "--tag", "red,,"],
+        &["tool", "--tag", "red,purple"],
+        &["tool", "--tag", "red,green,blue,"],
+        &["tool", "--tag", "red,", "--verbose"],
+        &["tool", "--tag", "red,", "run"],
+        &["tool", "--tag", "red,", "--"],
+        &["tool", "--tag", "red,zzz", ""],
+        &["tool", "run", "--tag", "red,"],
+        &["tool", "--tag", "red,green", "--", "run"],
+        &["tool", "--tag", "red,green", "--", "--tag"],
+        &["tool", "zzz"],
+        &["tool", "--bogus"],
+    ];
+    for args in bad_lines {
+        let os_args: Vec<std::ffi::OsString> =
+            args.iter().map(std::ffi::OsString::from).collect();
+        let result = clap_complete::engine::complete(
+            &mut cmd,
+            os_args,
+            args.len() - 1,
+            None,
+        );
+        assert!(result.is_ok(), "bad line {args:?} returned an error");
+    }
+
+    let values = complete_delimited_tag_with(&mut cmd, &["tool", "--tag", ""])
+        .into_iter()
+        .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(values, ["red", "green", "blue"]);
+
+    let values = complete_delimited_tag_with(&mut cmd, &["tool", "--tag", "red,"])
+        .into_iter()
+        .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(values, ["red,green", "red,blue"]);
+
+    let values = complete_delimited_tag_with(&mut cmd, &["tool", "run", "--tag", "job,"])
+        .into_iter()
+        .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(values, ["job,log", "job,tmp"]);
+
+    let values = complete_delimited_tag_with(&mut cmd, &["tool", ""])
+        .into_iter()
+        .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(values, ["run", "src", "dst", "--tag", "--verbose"]);
+}
+
 fn complete(cmd: &mut Command, args: impl AsRef<str>, current_dir: Option<&Path>) -> String {
     let input = args.as_ref();
     let mut args = vec![std::ffi::OsString::from(cmd.get_name())];
