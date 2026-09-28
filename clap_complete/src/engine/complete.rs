@@ -61,6 +61,34 @@ pub fn complete(
             );
         }
 
+        // An argument with an explicit `value_terminator` greedily consumes
+        // every word as one of its values (flag-like words and subcommand
+        // names included, when the argument allows hyphen values) until the
+        // standalone terminator ends the whole group and regular parsing
+        // resumes at the same command level.
+        if let Some(pending) = terminator_pending(current_cmd, pos_index, &current_state) {
+            if is_value_terminator(&arg, pending) {
+                if matches!(current_state, ParseState::Pos(..)) {
+                    pos_index += 1;
+                }
+                // A terminator spelled `--` doubles as the escape unless the
+                // pending argument consumes hyphen values itself.
+                if arg.is_escape() && !pending.is_allow_hyphen_values_set() {
+                    is_escaped = true;
+                    if let Some(last_index) = current_cmd
+                        .get_positionals()
+                        .filter(|p| p.is_last_set())
+                        .filter_map(|p| p.get_index())
+                        .max()
+                    {
+                        pos_index = last_index;
+                    }
+                }
+                next_state = ParseState::ValueDone;
+                continue;
+            }
+        }
+
         if !is_escaped && !matches!(current_state, ParseState::Opt(..) | ParseState::Pos(..)) {
             if let Ok(value) = arg.to_value() {
                 if let Some(next_cmd) = current_cmd.find_subcommand(value) {
@@ -883,6 +911,32 @@ fn parse_opt_value(opt: &clap::Arg, count: usize) -> ParseState<'_> {
     } else {
         ParseState::ValueDone
     }
+}
+
+/// The pending argument whose run of values ends on an explicit
+/// [`value_terminator`][clap::Arg::value_terminator], if the current state has one.
+fn terminator_pending<'a>(
+    cmd: &'a clap::Command,
+    pos_index: usize,
+    state: &ParseState<'a>,
+) -> Option<&'a clap::Arg> {
+    match state {
+        ParseState::Opt((opt, ..)) if opt.get_value_terminator().is_some() => Some(opt),
+        ParseState::Pos(..) => cmd
+            .get_positionals()
+            .find(|p| p.get_index() == Some(pos_index) && p.get_value_terminator().is_some()),
+        ParseState::ValueDone | ParseState::Opt(..) => None,
+    }
+}
+
+/// Whether `arg` is the pending argument's standalone value terminator.
+///
+/// Like the parser, a terminator must be its own argument; an attached value
+/// (`--opt=;`) never matches.
+fn is_value_terminator(arg: &clap_lex::ParsedArg<'_>, pending: &clap::Arg) -> bool {
+    pending
+        .get_value_terminator()
+        .is_some_and(|term| arg.to_value_os() == OsStr::new(term.as_str()))
 }
 
 /// How many of an option's values an attached `=value` (or `-ovalue`) accounts

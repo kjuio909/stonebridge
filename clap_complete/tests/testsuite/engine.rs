@@ -3327,6 +3327,374 @@ fn trailing_preserves_candidate_metadata() {
     );
 }
 
+fn define_tool_cmd() -> Command {
+    Command::new("tool")
+        .disable_help_flag(true)
+        .disable_version_flag(true)
+        .disable_help_subcommand(true)
+        .arg(
+            clap::Arg::new("define")
+                .long("define")
+                .action(clap::ArgAction::Append)
+                .num_args(1..)
+                .allow_hyphen_values(true)
+                .value_terminator(";")
+                .add(ArgValueCandidates::new(|| {
+                    vec![
+                        CompletionCandidate::new("name="),
+                        CompletionCandidate::new("path="),
+                    ]
+                })),
+        )
+        .arg(
+            clap::Arg::new("verbose")
+                .long("verbose")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(clap::Arg::new("path").value_parser(["src", "dst"]))
+        .subcommand(
+            Command::new("run")
+                .disable_help_flag(true)
+                .disable_version_flag(true)
+                .disable_help_subcommand(true)
+                .arg(
+                    clap::Arg::new("define")
+                        .long("define")
+                        .action(clap::ArgAction::Append)
+                        .num_args(1..)
+                        .allow_hyphen_values(true)
+                        .value_terminator(";")
+                        .add(ArgValueCandidates::new(|| {
+                            vec![
+                                CompletionCandidate::new("job="),
+                                CompletionCandidate::new("log="),
+                            ]
+                        })),
+                )
+                .arg(clap::Arg::new("target").value_parser(["test", "bench"])),
+        )
+}
+
+fn complete_define_tool(args: &[&str]) -> Vec<CompletionCandidate> {
+    let mut cmd = define_tool_cmd();
+    let args: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
+    let arg_index = args.len() - 1;
+    clap_complete::engine::complete(&mut cmd, args, arg_index, None).unwrap()
+}
+
+fn define_tool_values(args: &[&str]) -> Vec<String> {
+    complete_define_tool(args)
+        .into_iter()
+        .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+        .collect()
+}
+
+#[test]
+fn define_pending_value_completes_only_value_candidates() {
+    // The cursor sits inside the value group: only the value candidates are
+    // offered, never options, positionals, or the subcommand.
+    assert_eq!(
+        define_tool_values(&["tool", "--define", ""]),
+        ["name=", "path="]
+    );
+    assert_eq!(
+        define_tool_values(&["tool", "--define", "name="]),
+        ["name="]
+    );
+    assert_eq!(
+        define_tool_values(&["tool", "--define", "path="]),
+        ["path="]
+    );
+    // Values keep accumulating until the terminator.
+    assert_eq!(
+        define_tool_values(&["tool", "--define", "name=x", ""]),
+        ["name=", "path="]
+    );
+    assert_eq!(
+        define_tool_values(&["tool", "--define", "name=x", "path=y", ""]),
+        ["name=", "path="]
+    );
+}
+
+#[test]
+fn define_equals_form_matches_space_form() {
+    // `--define=`, `--define=name=` and the space-separated spelling share
+    // the same state: only value candidates, with the `--define=` prefix.
+    assert_eq!(
+        define_tool_values(&["tool", "--define="]),
+        ["--define=name=", "--define=path="]
+    );
+    assert_eq!(
+        define_tool_values(&["tool", "--define=name="]),
+        ["--define=name="]
+    );
+    // A first attached value followed by space-separated values stays in the
+    // group until the terminator.
+    assert_eq!(
+        define_tool_values(&["tool", "--define=name=x", ""]),
+        ["name=", "path="]
+    );
+    assert_eq!(
+        define_tool_values(&["tool", "--define=name=x", "path=y", ""]),
+        ["name=", "path="]
+    );
+}
+
+#[test]
+fn define_value_group_consumes_flags_subcommands_and_unknown_words() {
+    // Before the terminator, flag-like words, the `run` subcommand name and
+    // unknown words are all definition values: the layer must not switch.
+    assert_eq!(
+        define_tool_values(&["tool", "--define", "--verbose", ""]),
+        ["name=", "path="]
+    );
+    assert_eq!(
+        define_tool_values(&["tool", "--define", "--bogus", ""]),
+        ["name=", "path="]
+    );
+    assert_eq!(
+        define_tool_values(&["tool", "--define", "-x", ""]),
+        ["name=", "path="]
+    );
+    assert_eq!(
+        define_tool_values(&["tool", "--define", "run", ""]),
+        ["name=", "path="]
+    );
+    assert_eq!(
+        define_tool_values(&["tool", "--define", "name=x", "run", ""]),
+        ["name=", "path="]
+    );
+    // Completing such a word itself still completes it as a value (only
+    // matching value candidates are offered, which is a successful empty set
+    // when it does not match).
+    assert!(define_tool_values(&["tool", "--define", "--verbose"]).is_empty());
+    assert!(define_tool_values(&["tool", "--define", "run"]).is_empty());
+    assert!(define_tool_values(&["tool", "--define", "bogus"]).is_empty());
+}
+
+#[test]
+fn define_terminator_resumes_normal_completion() {
+    // After `;`, the terminator itself is not offered and the current level
+    // resumes normal options, positional values, and subcommands.
+    assert_eq!(
+        define_tool_values(&["tool", "--define", "name=x", ";", ""]),
+        ["run", "src", "dst", "--define", "--verbose"]
+    );
+    assert_eq!(
+        define_tool_values(&["tool", "--define", "name=x", "path=y", ";", ""]),
+        ["run", "src", "dst", "--define", "--verbose"]
+    );
+    // The terminator word itself completes to nothing.
+    assert!(define_tool_values(&["tool", "--define", "name=x", ";"]).is_empty());
+    // `--verbose` is visible after the terminator.
+    assert_eq!(
+        define_tool_values(&["tool", "--define", "name=x", ";", "--ver"]),
+        ["--verbose"]
+    );
+    // `run` after the terminator descends into the subcommand.
+    assert_eq!(
+        define_tool_values(&["tool", "--define", "name=x", ";", "run", ""]),
+        ["test", "bench", "--define"]
+    );
+}
+
+#[test]
+fn define_repeated_starts_a_fresh_value_group() {
+    // A second `--define` after a terminated group opens a brand-new value
+    // state with its own value candidates.
+    assert_eq!(
+        define_tool_values(&["tool", "--define", "name=x", ";", "--define", ""]),
+        ["name=", "path="]
+    );
+    assert_eq!(
+        define_tool_values(
+            &["tool", "--define", "name=x", ";", "--define", "path=y", ""]
+        ),
+        ["name=", "path="]
+    );
+    assert_eq!(
+        define_tool_values(
+            &["tool", "--define", "name=x", ";", "--define", "path=y", ";", ""]
+        ),
+        ["run", "src", "dst", "--define", "--verbose"]
+    );
+    // Equals form is equivalent.
+    assert_eq!(
+        define_tool_values(
+            &["tool", "--define=name=x", ";", "--define=", ""]
+        ),
+        ["name=", "path="]
+    );
+    assert_eq!(
+        define_tool_values(&["tool", "--define=name=x", ";", "--define="]),
+        ["--define=name=", "--define=path="]
+    );
+}
+
+#[test]
+fn define_boundary_does_not_reopen_the_group() {
+    // Words after the terminator never reopen the previous group: option-style
+    // words and unknown words resume normal parsing, with the positional slot
+    // still unfilled.
+    assert_eq!(
+        define_tool_values(&["tool", "--define", "name=x", ";", "--bogus", ""]),
+        ["run", "src", "dst", "--define", "--verbose"]
+    );
+    assert_eq!(
+        define_tool_values(&["tool", "--define", "name=x", ";", "-x", ""]),
+        ["run", "src", "dst", "--define", "--verbose"]
+    );
+    // A second `;` is a plain word now (only a pending terminator argument
+    // treats it as a terminator), so it fills the positional slot; either way
+    // the value group must not reopen.
+    assert_eq!(
+        define_tool_values(&["tool", "--define", "name=x", ";", ";", ""]),
+        ["run", "--define", "--verbose"]
+    );
+    // The `;` after the boundary completes nothing.
+    assert!(define_tool_values(&["tool", "--define", "name=x", ";", ";"]).is_empty());
+}
+
+#[test]
+fn define_run_level_is_isolated() {
+    // Entering `run` after a completed (or still open) root definition is
+    // governed only by the run-level rules; root values and positionals must
+    // never leak in.
+    assert_eq!(
+        define_tool_values(&["tool", "run", ""]),
+        ["test", "bench", "--define"]
+    );
+    assert_eq!(
+        define_tool_values(&["tool", "run", "--define", ""]),
+        ["job=", "log="]
+    );
+    assert_eq!(
+        define_tool_values(&["tool", "run", "--define", "job=x", ""]),
+        ["job=", "log="]
+    );
+    assert_eq!(
+        define_tool_values(&["tool", "run", "--define", "job=x", ";", ""]),
+        ["test", "bench", "--define"]
+    );
+    // A completed root definition followed by `run`.
+    assert_eq!(
+        define_tool_values(&["tool", "--define", "name=x", ";", "run", ""]),
+        ["test", "bench", "--define"]
+    );
+    assert_eq!(
+        define_tool_values(&["tool", "--define", "name=x", ";", "run", "--define", ""]),
+        ["job=", "log="]
+    );
+    // An unterminated root definition followed by `run` treats `run` as a
+    // value, so completion stays at the root level offering value candidates.
+    assert_eq!(
+        define_tool_values(&["tool", "--define", "name=x", "run", ""]),
+        ["name=", "path="]
+    );
+    // `name=` / `path=` never leak into run; `job=` / `log=` never leak out.
+    assert!(define_tool_values(&["tool", "run", "--define", "name="]).is_empty());
+    assert!(define_tool_values(&["tool", "run", "--define", "path="]).is_empty());
+    assert!(define_tool_values(&["tool", "--define", "job="]).is_empty());
+    assert!(define_tool_values(&["tool", "--define", "log="]).is_empty());
+    assert!(define_tool_values(&["tool", "--define", "name=x", ";", "run", "testv"]).is_empty());
+}
+
+#[test]
+fn define_invalid_inputs_are_successful_empty_and_do_not_pollute() {
+    let mut cmd = define_tool_cmd();
+    let complete = |cmd: &mut Command, args: &[&str]| {
+        let args: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
+        let arg_index = args.len() - 1;
+        clap_complete::engine::complete(cmd, args, arg_index, None)
+            .unwrap()
+            .into_iter()
+            .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+    };
+
+    // Invalid value prefix.
+    assert!(complete(&mut cmd, &["tool", "--define", "zzz"]).is_empty());
+    // Missing terminator.
+    assert!(complete(&mut cmd, &["tool", "--define", "name=x"]).is_empty());
+    // Repeated definitions are allowed; a repeated, unterminated group still
+    // completes its own values.
+    assert_eq!(
+        complete(
+            &mut cmd,
+            &["tool", "--define", "name=x", ";", "--define", "path=y", ""]
+        ),
+        ["name=", "path="]
+    );
+    // Out-of-range positionals after a terminated definition.
+    assert!(
+        complete(
+            &mut cmd,
+            &["tool", "--define", "name=x", ";", "src", "zzz"]
+        )
+        .is_empty()
+    );
+    // Unknown words after the terminator.
+    assert!(
+        complete(&mut cmd, &["tool", "--define", "name=x", ";", "bogus"]).is_empty()
+    );
+
+    // None of the failed inputs may pollute a later legal call on the same
+    // command object.
+    assert_eq!(
+        complete(&mut cmd, &["tool", ""]),
+        ["run", "src", "dst", "--define", "--verbose"]
+    );
+    assert_eq!(
+        complete(&mut cmd, &["tool", "--define", ""]),
+        ["name=", "path="]
+    );
+    assert_eq!(
+        complete(&mut cmd, &["tool", "--define", "name=x", ";", ""]),
+        ["run", "src", "dst", "--define", "--verbose"]
+    );
+    assert_eq!(
+        complete(&mut cmd, &["tool", "run", "--define", ""]),
+        ["job=", "log="]
+    );
+}
+
+#[test]
+fn define_preserves_candidate_metadata() {
+    // Value candidates keep their id/tag regardless of how the group was
+    // reached (space vs equals vs after several values).
+    let space = candidate_metadata(complete_define_tool(&["tool", "--define", ""]));
+    assert_eq!(
+        space,
+        candidate_metadata(complete_define_tool(&[
+            "tool", "--define", "name=x", ""
+        ]))
+    );
+    let equals: Vec<_> = complete_define_tool(&["tool", "--define="])
+        .into_iter()
+        .map(|candidate| {
+            (
+                candidate.get_value().to_string_lossy().into_owned(),
+                candidate.get_help().map(|help| help.to_string()),
+                candidate.get_id().cloned(),
+                candidate.get_tag().map(|tag| tag.to_string()),
+                candidate.get_display_order(),
+                candidate.is_hide_set(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        equals.iter().map(|c| c.2.clone()).collect::<Vec<_>>(),
+        space.iter().map(|c| c.2.clone()).collect::<Vec<_>>()
+    );
+    assert!(space.iter().all(|candidate| !candidate.5));
+
+    // After the terminator the resumed candidates match the plain baseline.
+    let baseline = candidate_metadata(complete_define_tool(&["tool", ""]));
+    let resumed =
+        candidate_metadata(complete_define_tool(&["tool", "--define", "name=x", ";", ""]));
+    assert_eq!(baseline, resumed);
+}
+
 fn complete(cmd: &mut Command, args: impl AsRef<str>, current_dir: Option<&Path>) -> String {
     let input = args.as_ref();
     let mut args = vec![std::ffi::OsString::from(cmd.get_name())];
