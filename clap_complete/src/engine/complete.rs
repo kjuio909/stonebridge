@@ -42,6 +42,9 @@ pub fn complete(
     let mut is_escaped = false;
     let mut next_state = ParseState::ValueDone;
     let mut used_args = Vec::<clap::Id>::new();
+    // Once a committed word selected an external subcommand, every remaining
+    // word belongs to that external program and is never completed here.
+    let mut in_external = false;
     while let Some(arg) = raw_args.next(&mut cursor) {
         let current_state = next_state;
         next_state = ParseState::ValueDone;
@@ -84,6 +87,18 @@ pub fn complete(
                 continue;
             }
         }
+        if in_external {
+            // A committed word already selected an external subcommand; this
+            // word (and every later one) is an argument of that external
+            // program. Its command line is unknown, so rather than falling
+            // back to the current command's subcommands, options, or
+            // positionals, completion succeeds with an empty set.
+            if cursor == target_cursor {
+                return Ok(Vec::new());
+            }
+            continue;
+        }
+
         if cursor == target_cursor {
             return complete_arg(
                 &arg,
@@ -102,6 +117,22 @@ pub fn complete(
                     current_cmd = next_cmd;
                     pos_index = 1;
                     used_args.clear();
+                    continue;
+                }
+                // An unknown plain word, with no positional slot left to
+                // fill, selects an external subcommand: the parser routes
+                // everything after it to that external program. Flag-like
+                // words and the escape are still parsed as flags, matching
+                // that precedence, and an empty word is a cursor placeholder
+                // rather than a program name.
+                if current_cmd.is_allow_external_subcommands_set()
+                    && !arg.is_empty()
+                    && !arg.is_escape()
+                    && arg.to_long().is_none()
+                    && arg.to_short().is_none()
+                    && find_positional(current_cmd, pos_index, false).is_none()
+                {
+                    in_external = true;
                     continue;
                 }
             }

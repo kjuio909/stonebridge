@@ -4107,6 +4107,369 @@ fn define_bad_inputs_do_not_pollute_command_state() {
     assert_eq!(values, ["run", "src", "dst", "--define", "--verbose"]);
 }
 
+fn external_tool_cmd() -> Command {
+    // `tool` with external subcommands enabled: a repeatable comma-delimited
+    // `--tag` at the root, and an ordinary `run` subcommand with the `job` and
+    // `log` positionals. No external subcommand candidates are registered, so
+    // the root level may only ever list `run` and `--tag`.
+    Command::new("tool")
+        .disable_help_flag(true)
+        .disable_version_flag(true)
+        .disable_help_subcommand(true)
+        .allow_external_subcommands(true)
+        .arg(
+            clap::Arg::new("tag")
+                .long("tag")
+                .action(clap::ArgAction::Append)
+                .num_args(1..=3)
+                .value_delimiter(',')
+                .value_parser(["red", "green", "blue"]),
+        )
+        .subcommand(
+            Command::new("run")
+                .disable_help_flag(true)
+                .disable_version_flag(true)
+                .disable_help_subcommand(true)
+                .arg(clap::Arg::new("job").value_parser(["job"]))
+                .arg(clap::Arg::new("log").value_parser(["log"])),
+        )
+}
+
+fn complete_external_with(
+    cmd: &mut Command,
+    args: &[&str],
+) -> Vec<CompletionCandidate> {
+    let args: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
+    let arg_index = args.len() - 1;
+    clap_complete::engine::complete(cmd, args, arg_index, None).unwrap()
+}
+
+fn complete_external(args: &[&str]) -> Vec<CompletionCandidate> {
+    let mut cmd = external_tool_cmd();
+    complete_external_with(&mut cmd, args)
+}
+
+fn external_values(args: &[&str]) -> Vec<String> {
+    complete_external(args)
+        .into_iter()
+        .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+        .collect()
+}
+
+#[test]
+fn external_root_empty_lists_only_declared_items() {
+    // With no external subcommand candidates registered, the empty root word
+    // offers only the declared subcommand and option, never a fabricated
+    // external command.
+    assert_eq!(external_values(&["tool", ""]), ["run", "--tag"]);
+
+    // The surviving candidates carry their ordinary metadata.
+    let metadata = candidate_metadata(complete_external(&["tool", ""]));
+    let values: Vec<_> = metadata.iter().map(|m| m.0.clone()).collect();
+    assert_eq!(values, ["run", "--tag"]);
+    assert_eq!(metadata[0].2.as_deref(), Some("command::run"));
+    assert_eq!(metadata[0].3.as_deref(), Some("Commands"));
+    assert!(!metadata[0].5);
+    assert_eq!(metadata[1].2.as_deref(), Some("arg::tag"));
+    assert_eq!(metadata[1].3.as_deref(), Some("Options"));
+    assert!(!metadata[1].5);
+}
+
+#[test]
+fn external_first_word_prefix_still_matches_run() {
+    // While the cursor is still on the first (unknown) word, name prefix
+    // completion behaves exactly as without external subcommands.
+    assert_eq!(external_values(&["tool", "r"]), ["run"]);
+    assert_eq!(external_values(&["tool", "ru"]), ["run"]);
+    assert_eq!(external_values(&["tool", "run"]), ["run"]);
+
+    // A prefix (or a fully typed word) that matches nothing is a successful
+    // empty set: the external program name is not offered because none is
+    // registered.
+    assert_eq!(external_values(&["tool", "x"]), Vec::<String>::new());
+    assert_eq!(external_values(&["tool", "xyz"]), Vec::<String>::new());
+}
+
+#[test]
+fn external_unknown_word_then_empty_enters_external_zone() {
+    // Once the unknown word is committed and the next (empty) word is
+    // requested, completion has entered the external program's arguments and
+    // succeeds with an empty set instead of falling back to the root scope.
+    assert_eq!(
+        external_values(&["tool", "xyz", ""]),
+        Vec::<String>::new()
+    );
+    // Cursor still on the unknown word itself is not yet the external zone.
+    assert_eq!(external_values(&["tool", "xyz"]), Vec::<String>::new());
+}
+
+#[test]
+fn external_zone_words_never_return_to_root_scope() {
+    // Plain words, every option style, the declared subcommand name, and
+    // another unknown word are all arguments of the selected external
+    // program: a successful empty set with no root candidates leaking.
+    let cases: &[&[&str]] = &[
+        &["tool", "xyz", "foo"],
+        &["tool", "xyz", "foo", ""],
+        &["tool", "xyz", "second-unknown"],
+        &["tool", "xyz", "zzz", ""],
+        &["tool", "xyz", "--tag"],
+        &["tool", "xyz", "--tag", ""],
+        &["tool", "xyz", "--tag=red"],
+        &["tool", "xyz", "--tag", "red"],
+        &["tool", "xyz", "--unknown"],
+        &["tool", "xyz", "--unknown=1"],
+        &["tool", "xyz", "-x"],
+        &["tool", "xyz", "-xy"],
+        &["tool", "xyz", "run"],
+        &["tool", "xyz", "run", ""],
+    ];
+    for args in cases {
+        assert_eq!(
+            external_values(args),
+            Vec::<String>::new(),
+            "expected no candidates for {args:?}"
+        );
+    }
+
+    // None of the root-level names may be suggested anywhere past the
+    // selected external subcommand, including under a prefix.
+    for args in [
+        &["tool", "xyz", "r"][..],
+        &["tool", "xyz", "--t"],
+        &["tool", "xyz", "--tag", "r"],
+    ] {
+        let candidates = complete_external(args);
+        assert!(
+            candidates.is_empty(),
+            "expected no root candidates for {args:?}, got {candidates:?}"
+        );
+    }
+}
+
+#[test]
+fn external_zone_terminator_and_beyond_is_empty() {
+    // The terminator itself, when the cursor is on it after the external
+    // program name, belongs to the external program, as does everything after
+    // it: always a successful empty set.
+    for args in [
+        &["tool", "xyz", "--"][..],
+        &["tool", "xyz", "--", ""],
+        &["tool", "xyz", "--", "anything"],
+        &["tool", "xyz", "--", "--tag"],
+        &["tool", "xyz", "--", "run"],
+        &["tool", "xyz", "foo", "--", "bar"],
+    ] {
+        assert_eq!(
+            external_values(args),
+            Vec::<String>::new(),
+            "expected no candidates for {args:?}"
+        );
+    }
+}
+
+#[test]
+fn external_zone_entered_after_complete_tag_group() {
+    // A complete comma-delimited tag group (space and equals forms) closes
+    // the option, so a later unknown first word switches to the external
+    // argument zone.
+    assert_eq!(
+        external_values(&["tool", "--tag", "red,green,blue", "ext", ""]),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        external_values(&["tool", "--tag=red,green,blue", "ext", ""]),
+        Vec::<String>::new()
+    );
+    // A single-fragment group also closes the option occurrence.
+    assert_eq!(
+        external_values(&["tool", "--tag", "red", "ext", ""]),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        external_values(&["tool", "--tag=red", "ext", ""]),
+        Vec::<String>::new()
+    );
+
+    // The root tag values never leak into the external zone.
+    assert!(complete_external(&["tool", "ext", "--tag=red"]).is_empty());
+    assert!(complete_external(&["tool", "ext", "--tag", "r"]).is_empty());
+}
+
+#[test]
+fn external_zone_waits_for_pending_tag_group() {
+    // While a tag fragment is still pending (a trailing comma opened it, in
+    // either the space or equals form), the next word is still a tag value
+    // and offers the remaining legal values instead of switching to the
+    // external program.
+    assert_eq!(
+        external_values(&["tool", "--tag", "red,", ""]),
+        ["green", "blue"]
+    );
+    assert_eq!(
+        external_values(&["tool", "--tag=red,", ""]),
+        ["green", "blue"]
+    );
+    assert_eq!(
+        external_values(&["tool", "--tag", "red,", "g"]),
+        ["green"]
+    );
+    assert_eq!(
+        external_values(&["tool", "--tag=red,g"]),
+        ["--tag=red,green"]
+    );
+
+    // An unknown word while the group is open is validated as a fragment,
+    // not taken as the external program name, and stays locked on the group.
+    assert_eq!(
+        external_values(&["tool", "--tag", "red,", "ext"]),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        external_values(&["tool", "--tag", "red,,", "ext"]),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        external_values(&["tool", "--tag", "red,,", "--", ""]),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn external_run_scope_is_isolated() {
+    // `run` completes its own positional values, in order.
+    assert_eq!(external_values(&["tool", "run", ""]), ["job"]);
+    assert_eq!(external_values(&["tool", "run", "job", ""]), ["log"]);
+    // Past the declared positionals completion is empty (and still succeeds).
+    assert_eq!(
+        external_values(&["tool", "run", "job", "log", ""]),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        external_values(&["tool", "run", "job", "log", "extra"]),
+        Vec::<String>::new()
+    );
+
+    // The run-level values never leak to the root.
+    let root = external_values(&["tool", ""]);
+    assert!(!root.contains(&"job".to_owned()));
+    assert!(!root.contains(&"log".to_owned()));
+
+    // A name matching `run` before the external word descends normally.
+    assert_eq!(external_values(&["tool", "run", "j"]), ["job"]);
+}
+
+#[test]
+fn external_bad_inputs_never_error() {
+    let mut cmd = external_tool_cmd();
+    let bad_lines: &[&[&str]] = &[
+        // Illegal tag fragments and prefixes that match nothing.
+        &["tool", "--tag", "bogus"],
+        &["tool", "--tag=zzz"],
+        &["tool", "--tag", "red,red"],
+        &["tool", "--tag", "red,,green"],
+        &["tool", "--tag", "red,green,blue,x"],
+        &["tool", "x"],
+        &["tool", "--bogus"],
+        &["tool", "-x"],
+        // Out-of-range positionals inside `run`.
+        &["tool", "run", "job", "log", "extra"],
+        // Arbitrary failures inside the external argument zone.
+        &["tool", "ext", ""],
+        &["tool", "ext", "--", "anything"],
+        &["tool", "ext", "--tag=red"],
+    ];
+    for args in bad_lines {
+        let os_args: Vec<std::ffi::OsString> =
+            args.iter().map(std::ffi::OsString::from).collect();
+        let result =
+            clap_complete::engine::complete(&mut cmd, os_args, args.len() - 1, None);
+        assert!(result.is_ok(), "line {args:?} returned an error");
+    }
+}
+
+#[test]
+fn external_state_recovers_identically_on_reuse() {
+    // Drive one Command through external-zone and failing paths, then verify
+    // every later completion matches a fresh Command exactly: set, order,
+    // text, prefix form, help, hidden flag, group, and identifier.
+    let mut cmd = external_tool_cmd();
+    for args in [
+        &["tool", "ext", ""][..],
+        &["tool", "ext", "--tag", "red"],
+        &["tool", "ext", "run"],
+        &["tool", "ext", "--", ""],
+        &["tool", "--tag", "red,,", "ext"],
+        &["tool", "--bogus"],
+        &["tool", "run", "job", "log", "extra"],
+    ] {
+        let os_args: Vec<std::ffi::OsString> =
+            args.iter().map(std::ffi::OsString::from).collect();
+        clap_complete::engine::complete(&mut cmd, os_args, args.len() - 1, None).unwrap();
+    }
+
+    // Root empty word.
+    assert_eq!(
+        candidate_metadata(complete_external_with(&mut cmd, &["tool", ""])),
+        candidate_metadata(complete_external(&["tool", ""])),
+    );
+    // Legal tag values in both forms.
+    assert_eq!(
+        candidate_metadata(complete_external_with(&mut cmd, &["tool", "--tag", "r"])),
+        candidate_metadata(complete_external(&["tool", "--tag", "r"])),
+    );
+    let reused_attached = complete_external_with(&mut cmd, &["tool", "--tag=r"]);
+    let fresh_attached = complete_external(&["tool", "--tag=r"]);
+    assert_eq!(
+        candidate_metadata(reused_attached),
+        candidate_metadata(fresh_attached),
+    );
+    // Pending group fragment after the external path still completes normally.
+    assert_eq!(
+        candidate_metadata(complete_external_with(&mut cmd, &["tool", "--tag", "red,", "g"])),
+        candidate_metadata(complete_external(&["tool", "--tag", "red,", "g"])),
+    );
+    // Run-level completion is unaffected.
+    assert_eq!(
+        candidate_metadata(complete_external_with(&mut cmd, &["tool", "run", ""])),
+        candidate_metadata(complete_external(&["tool", "run", ""])),
+    );
+    assert_eq!(
+        candidate_metadata(complete_external_with(
+            &mut cmd,
+            &["tool", "run", "job", ""]
+        )),
+        candidate_metadata(complete_external(&["tool", "run", "job", ""])),
+    );
+}
+
+#[test]
+fn external_space_and_equals_tag_forms_keep_metadata() {
+    // With external subcommands enabled, the space and equals forms of a tag
+    // value still produce identical fragment candidates (modulo the flag
+    // prefix), the same metadata, and ordering.
+    let spaced = candidate_metadata(complete_external(&["tool", "--tag", "red,g"]));
+    let attached = candidate_metadata(complete_external(&["tool", "--tag=red,g"]));
+    let attached_stripped: CandidateMetadata = attached
+        .into_iter()
+        .map(|(value, help, id, tag, order, hidden)| {
+            (
+                value
+                    .strip_prefix("--tag=")
+                    .expect("attached prefix")
+                    .to_owned(),
+                help,
+                id,
+                tag,
+                order,
+                hidden,
+            )
+        })
+        .next()
+        .expect("one candidate");
+    assert_eq!(spaced, vec![attached_stripped]);
+}
+
 fn complete(cmd: &mut Command, args: impl AsRef<str>, current_dir: Option<&Path>) -> String {
     let input = args.as_ref();
     let mut args = vec![std::ffi::OsString::from(cmd.get_name())];
