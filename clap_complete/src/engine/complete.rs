@@ -21,7 +21,49 @@ pub fn complete(
     debug!("complete: args={args:?}, arg_index={arg_index:?}, current_dir={current_dir:?}");
     cmd.build();
 
+    let mut final_len = args.len();
     let mut raw_args = clap_lex::RawArgs::new(args);
+
+    // A multicall binary chooses its applet from the file name it was invoked
+    // as, just like the parser reinterprets `argv[0]` as the first word. The
+    // resolved applet is inserted right after `argv[0]` so the regular loop
+    // descends into it; from then on completion is scoped to that applet and
+    // never sees the aggregate command's root.
+    //
+    // `arg_index` addresses the words the caller passed, where `argv[0]` is
+    // index 0. The inserted word sits at index 1, so a cursor on any later word
+    // moves one position to the right.
+    let mut arg_index = arg_index;
+    if cmd.is_multicall_set() {
+        let mut argv0_cursor = raw_args.cursor();
+        if let Some(argv0) = raw_args.next_os(&mut argv0_cursor) {
+            if let Some(applet) = std::path::Path::new(argv0)
+                .file_stem()
+                .and_then(|file_stem| file_stem.to_str())
+            {
+                // Borrow `cmd` through an owned name so `raw_args` can be mutated.
+                let applet = applet.to_owned();
+                if cmd.find_subcommand(&applet).is_none() {
+                    return Err(std::io::Error::other(format!(
+                        "unrecognized multicall command `{applet}`"
+                    )));
+                }
+                raw_args.insert(&argv0_cursor, [OsString::from(applet)]);
+                final_len += 1;
+                if arg_index != 0 {
+                    arg_index += 1;
+                }
+            }
+        }
+    }
+
+    // A cursor at or past the final word names nothing to complete. (Shells
+    // that complete a freshly typed empty word append it to `args` and address
+    // its index instead, so it is still completed normally.)
+    if arg_index >= final_len {
+        return Ok(Vec::new());
+    }
+
     let mut cursor = raw_args.cursor();
     let mut target_cursor = raw_args.cursor();
     raw_args.seek(
@@ -32,7 +74,6 @@ pub fn complete(
     raw_args.next_os(&mut target_cursor);
     debug!("complete: target_cursor={target_cursor:?}");
 
-    // TODO: Multicall support
     if !cmd.is_no_binary_name_set() {
         raw_args.next_os(&mut cursor);
     }

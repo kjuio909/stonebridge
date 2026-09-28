@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
 
+### Features
+
+- *(dynamic)* Scope completion to the applet selected from the executable's file name for `Command::multicall(true)`, reporting an error for unrecognized applets instead of completing the aggregate command
+
 ### Fixes
 
 - *(dynamic)* Respect `Arg::value_terminator`, completing an option's values until its terminator and resuming ordinary completion afterwards
