@@ -1962,9 +1962,10 @@ fn root_name_prefix_returns_only_matches() {
     assert_eq!(alias_tool_values(&["tool", "ru"]), ["run"]);
     assert_eq!(alias_tool_values(&["tool", "i"]), ["inspect", "i"]);
     assert_eq!(alias_tool_values(&["tool", "in"]), ["inspect"]);
-    // A prefix matching only the hidden alias still offers it, as no visible
-    // candidate matches.
-    assert_eq!(alias_tool_values(&["tool", "l"]), ["legacy-run"]);
+    // A prefix matching only a hidden alias of a visible command offers
+    // nothing: the alias stays usable when typed in full but is never
+    // suggested, even when no visible candidate matches the prefix.
+    assert!(alias_tool_values(&["tool", "l"]).is_empty());
 }
 
 #[test]

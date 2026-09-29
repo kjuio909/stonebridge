@@ -3454,6 +3454,12 @@ impl Command {
     ///   [`Command::no_binary_name`][Command::no_binary_name] was set.
     /// - Help and errors to report subcommands as if they were the top-level command
     ///
+    /// `multicall` already reinterprets `argv[0]` the way `no_binary_name` does, so the two
+    /// settings do not need to be combined at parse time. Setting both is still accepted and
+    /// may be relied on by consumers (like dynamic completion) that build a command without
+    /// parsing `argv[0]` themselves; when both are set, the `argv[0]`-derived applet wins and
+    /// no additional binary name is consumed.
+    ///
     /// When the subcommand is not present, there are several strategies you may employ, depending
     /// on your needs:
     /// - Let the error percolate up normally
@@ -3467,13 +3473,6 @@ impl Command {
     /// might report the same error.  Enable
     /// [`allow_external_subcommands`][Command::allow_external_subcommands] if you want to specifically
     /// get the unrecognized binary name.
-    ///
-    /// <div class="warning">
-    ///
-    /// **NOTE:** Multicall can't be used with [`no_binary_name`] since they interpret
-    /// the command name in incompatible ways.
-    ///
-    /// </div>
     ///
     /// <div class="warning">
     ///

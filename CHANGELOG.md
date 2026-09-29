@@ -26,6 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixes
 
+- *(complete)* Resolve the applet from `argv[0]` when both `multicall` and `no_binary_name` are set, keeping no-binary-name cursor semantics: the consumed `argv[0]` is never a completion target, and completion is scoped to the resolved applet for every `argv[0]` spelling
+- *(complete)* A hidden alias of a visible subcommand stays usable when typed in full but is no longer offered as a completion on an empty word or any (even unique) name prefix
 - *(complete)* Validate delimiter-separated value fragments while completing: duplicate, unknown, and empty fragments (including doubled or trailing delimiters) return an empty set instead of suggestions, fragments past the argument's capacity are suppressed, and a still-open fragment keeps flag-like words, the value terminator, and subcommand names within the option's scope until the group is complete
 
 ## [4.6.7] - 2026-09-14

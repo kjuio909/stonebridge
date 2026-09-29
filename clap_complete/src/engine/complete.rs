@@ -34,6 +34,8 @@ pub fn complete(
     // index 0. The inserted word sits at index 1, so a cursor on any later word
     // moves one position to the right.
     let mut arg_index = arg_index;
+    // Whether the resolved applet was inserted right after `argv[0]`.
+    let mut descended_applet = false;
     if cmd.is_multicall_set() {
         let mut argv0_cursor = raw_args.cursor();
         if let Some(argv0) = raw_args.next_os(&mut argv0_cursor) {
@@ -49,6 +51,7 @@ pub fn complete(
                     )));
                 }
                 raw_args.insert(&argv0_cursor, [OsString::from(applet)]);
+                descended_applet = true;
                 final_len += 1;
                 if arg_index != 0 {
                     arg_index += 1;
@@ -63,6 +66,13 @@ pub fn complete(
     if arg_index >= final_len {
         return Ok(Vec::new());
     }
+    // In multicall mode `argv[0]` was consumed to select the applet and is no
+    // longer a logical word, so a cursor on it completes nothing rather than
+    // erroring or completing at the aggregate root. This keeps no-binary-name
+    // cursor semantics: logical words begin after the resolved applet.
+    if descended_applet && arg_index == 0 {
+        return Ok(Vec::new());
+    }
 
     let mut cursor = raw_args.cursor();
     let mut target_cursor = raw_args.cursor();
@@ -74,7 +84,11 @@ pub fn complete(
     raw_args.next_os(&mut target_cursor);
     debug!("complete: target_cursor={target_cursor:?}");
 
-    if !cmd.is_no_binary_name_set() {
+    // Multicall already consumed `argv[0]` to select the applet and inserted
+    // that applet in its place, so it is never parsed as a word again, even in
+    // no-binary-name mode. Without multicall, `argv[0]` is skipped as the
+    // binary name unless `no_binary_name` is set.
+    if descended_applet || !cmd.is_no_binary_name_set() {
         raw_args.next_os(&mut cursor);
     }
 
@@ -1003,7 +1017,14 @@ fn subcommands(p: &clap::Command) -> Vec<CompletionCandidate> {
                 .into_iter()
                 .map(|s| populate_command_candidate(s, p, sc))
                 .chain(
+                    // A hidden alias keeps an undocumented spelling usable when
+                    // typed out exactly (descent goes through `find_subcommand`),
+                    // but it must never be offered as a suggestion of a visible
+                    // command. When the command itself is hidden, its aliases are
+                    // hidden too and are still emitted so that the all-hidden
+                    // fallback in `complete_arg` can keep the command reachable.
                     sc.get_aliases()
+                        .filter(|_| sc.is_hide_set())
                         .map(|s| populate_command_candidate(s, p, sc).hide(true)),
                 )
         })
