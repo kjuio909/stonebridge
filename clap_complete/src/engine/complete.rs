@@ -97,6 +97,12 @@ pub fn complete(
     let mut is_escaped = false;
     let mut next_state = ParseState::ValueDone;
     let mut used_args = Vec::<clap::Id>::new();
+    // Whether an exclusive argument was committed at the current scope. Like
+    // the parser's exclusive constraint, no later word may name anything else
+    // (another option, a value, or a subcommand): every later word completes
+    // with an empty set. The latch resets on descending into a subcommand,
+    // whose scope starts with no consumed arguments.
+    let mut exclusive = false;
     // Once a committed word selected an external subcommand, every remaining
     // word belongs to that external program and is never completed here.
     let mut in_external = false;
@@ -155,6 +161,18 @@ pub fn complete(
         }
 
         if cursor == target_cursor {
+            // While the exclusive argument is still waiting for its own value,
+            // that value is the one thing allowed to complete; any other word
+            // after a committed exclusive argument is blocked below.
+            let completing_exclusive_value =
+                matches!(&current_state, ParseState::Opt(state) if state.opt.is_exclusive_set());
+            if exclusive && !completing_exclusive_value {
+                // The cursor names a word after a committed exclusive
+                // argument. The parser rejects anything that follows it, so
+                // complete successfully with an empty set instead of offering
+                // options, values, or subcommands that can never be accepted.
+                return Ok(Vec::new());
+            }
             return complete_arg(
                 &arg,
                 current_cmd,
@@ -166,12 +184,26 @@ pub fn complete(
             );
         }
 
+        if exclusive
+            && !matches!(&current_state, ParseState::Opt(state) if state.opt.is_exclusive_set())
+        {
+            // A committed exclusive argument owns the rest of the scope: no
+            // later word may descend into a subcommand, start another option,
+            // or fill a positional. Swallowing the word (rather than parsing
+            // it) keeps the latch set for every word that follows.
+            continue;
+        }
+
         if !is_escaped && !matches!(current_state, ParseState::Opt(..) | ParseState::Pos(..)) {
             if let Ok(value) = arg.to_value() {
                 if let Some(next_cmd) = current_cmd.find_subcommand(value) {
                     current_cmd = next_cmd;
                     pos_index = 1;
                     used_args.clear();
+                    // The subcommand's scope starts with no consumed
+                    // arguments, so an exclusive choice at the parent scope
+                    // does not carry into it.
+                    exclusive = false;
                     continue;
                 }
                 // An unknown plain word, with no positional slot left to
@@ -242,6 +274,9 @@ pub fn complete(
 
                 if let Some(opt) = opt {
                     record_used_arg(&mut used_args, opt.get_id());
+                    if opt.is_exclusive_set() {
+                        exclusive = true;
+                    }
                     if opt.get_num_args().expect("built").takes_values() {
                         // An attached value (`--opt=value`) counts toward the
                         // option's values just like a space-separated one, so
@@ -265,6 +300,9 @@ pub fn complete(
                 parse_shortflags(current_cmd, short);
             for opt in &matched_opts {
                 record_used_arg(&mut used_args, opt.get_id());
+                if opt.is_exclusive_set() {
+                    exclusive = true;
+                }
             }
             if let Some(opt) = takes_value_opt {
                 // An attached value (`-ovalue`, `-o=value`) counts toward the
