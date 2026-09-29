@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Fixes
 
 - *(dynamic)* Respect `Arg::value_terminator`, completing an option's values until its terminator and resuming ordinary completion afterwards
+- *(dynamic)* Complete correctly when `multicall` and `no_binary_name` are combined: the executable name still selects the applet (by name or alias, stripping directory and extension) while index 0 is completed at the aggregate root
+- *(dynamic)* Never suggest a hidden alias of a visible subcommand, at an empty word or from a name prefix; the exact spelling still enters the subcommand
 
 ## [4.6.10] - 2026-09-14
 

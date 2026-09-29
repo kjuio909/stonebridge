@@ -393,7 +393,6 @@ pub(crate) fn assert_app(cmd: &Command) {
     }
 
     cmd._panic_on_missing_help(cmd.is_help_expected_set());
-    assert_app_flags(cmd);
 }
 
 fn duplicate_tip(cmd: &Command, first: &Arg, second: &Arg) -> &'static str {
@@ -479,29 +478,6 @@ fn find_duplicates<T: PartialEq>(slice: &[T]) -> impl Iterator<Item = (&T, &T)> 
             None
         }
     })
-}
-
-fn assert_app_flags(cmd: &Command) {
-    macro_rules! checker {
-        ($a:ident conflicts $($b:ident)|+) => {
-            if cmd.$a() {
-                let mut s = String::new();
-
-                $(
-                    if cmd.$b() {
-                        use std::fmt::Write;
-                        write!(&mut s, "  AppSettings::{} conflicts with AppSettings::{}.\n", std::stringify!($b), std::stringify!($a)).unwrap();
-                    }
-                )+
-
-                if !s.is_empty() {
-                    panic!("{}\n{}", cmd.get_name(), s)
-                }
-            }
-        };
-    }
-
-    checker!(is_multicall_set conflicts is_no_binary_name_set);
 }
 
 #[cfg(debug_assertions)]

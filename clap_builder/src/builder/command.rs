@@ -3470,8 +3470,8 @@ impl Command {
     ///
     /// <div class="warning">
     ///
-    /// **NOTE:** Multicall can't be used with [`no_binary_name`] since they interpret
-    /// the command name in incompatible ways.
+    /// **NOTE:** When combined with [`no_binary_name`], `multicall` takes precedence for
+    /// `argv[0]`: the file name is still parsed as the applet selector.
     ///
     /// </div>
     ///

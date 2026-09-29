@@ -476,6 +476,46 @@ fn hostname_like_multicall() {
 }
 
 #[test]
+fn multicall_with_no_binary_name_still_dispatches_on_argv0() {
+    fn applet_commands() -> [Command; 2] {
+        [Command::new("true"), Command::new("false")]
+    }
+    // The two settings are allowed together: `multicall` takes precedence for
+    // `argv[0]`, resolving its file stem as the applet selector.
+    let cmd = Command::new("busybox")
+        .multicall(true)
+        .no_binary_name(true)
+        .subcommand(Command::new("busybox").defer(|cmd| cmd.subcommands(applet_commands())))
+        .subcommands(applet_commands());
+
+    // A bare file name resolves to the top-level applet...
+    let m = cmd
+        .clone()
+        .try_get_matches_from(["true"])
+        .unwrap();
+    assert_eq!(m.subcommand_name(), Some("true"));
+
+    // ...and a full path, with or without an extension, is stripped the same
+    // way a normal multicall invocation strips it.
+    let m = cmd
+        .clone()
+        .try_get_matches_from(["/usr/bin/false"])
+        .unwrap();
+    assert_eq!(m.subcommand_name(), Some("false"));
+    let m = cmd
+        .clone()
+        .try_get_matches_from(["busybox.exe", "true"])
+        .unwrap();
+    assert_eq!(m.subcommand_name(), Some("busybox"));
+    assert_eq!(m.subcommand().unwrap().1.subcommand_name(), Some("true"));
+
+    // An unrecognized file name is still an applet error, never a positional.
+    let m = cmd.try_get_matches_from(["a.out"]);
+    assert!(m.is_err());
+    assert_eq!(m.unwrap_err().kind(), ErrorKind::InvalidSubcommand);
+}
+
+#[test]
 #[cfg(feature = "error-context")]
 fn bad_multicall_command_error() {
     let cmd = Command::new("repl")

@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
 
+### Features
+
+- Allow `Command::multicall(true)` together with `Command::no_binary_name(true)`; the executable name is still parsed as the applet selector, taking precedence for the first word
+
 ### Fixes
 
 - *(complete)* Validate delimiter-separated value fragments while completing: duplicate, unknown, and empty fragments (including doubled or trailing delimiters) return an empty set instead of suggestions, fragments past the argument's capacity are suppressed, and a still-open fragment keeps flag-like words, the value terminator, and subcommand names within the option's scope until the group is complete

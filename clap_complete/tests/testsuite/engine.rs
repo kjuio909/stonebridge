@@ -1962,9 +1962,10 @@ fn root_name_prefix_returns_only_matches() {
     assert_eq!(alias_tool_values(&["tool", "ru"]), ["run"]);
     assert_eq!(alias_tool_values(&["tool", "i"]), ["inspect", "i"]);
     assert_eq!(alias_tool_values(&["tool", "in"]), ["inspect"]);
-    // A prefix matching only the hidden alias still offers it, as no visible
-    // candidate matches.
-    assert_eq!(alias_tool_values(&["tool", "l"]), ["legacy-run"]);
+    // A prefix matching only a hidden alias of a visible subcommand offers
+    // nothing; the exact spelling still enters the subcommand (see
+    // `hidden_alias_descent_matches_canonical_path`).
+    assert_eq!(alias_tool_values(&["tool", "l"]), [] as [String; 0]);
 }
 
 #[test]

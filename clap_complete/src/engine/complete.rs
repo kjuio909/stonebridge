@@ -33,8 +33,14 @@ pub fn complete(
     // `arg_index` addresses the words the caller passed, where `argv[0]` is
     // index 0. The inserted word sits at index 1, so a cursor on any later word
     // moves one position to the right.
+    //
+    // With `no_binary_name`, index 0 is itself a typed word rather than the
+    // shell's binary name. When the cursor sits on it the applet selector is
+    // still being typed, so it is completed at the aggregate root like any
+    // other subcommand word; resolution only applies once it is committed.
     let mut arg_index = arg_index;
-    if cmd.is_multicall_set() {
+    let mut argv0_consumed = false;
+    if cmd.is_multicall_set() && !(cmd.is_no_binary_name_set() && arg_index == 0) {
         let mut argv0_cursor = raw_args.cursor();
         if let Some(argv0) = raw_args.next_os(&mut argv0_cursor) {
             if let Some(applet) = std::path::Path::new(argv0)
@@ -53,6 +59,7 @@ pub fn complete(
                 if arg_index != 0 {
                     arg_index += 1;
                 }
+                argv0_consumed = true;
             }
         }
     }
@@ -74,7 +81,10 @@ pub fn complete(
     raw_args.next_os(&mut target_cursor);
     debug!("complete: target_cursor={target_cursor:?}");
 
-    if !cmd.is_no_binary_name_set() {
+    // `argv[0]` is skipped when it names the binary, and when multicall
+    // already consumed it as the applet selector: with `no_binary_name` also
+    // set it must not be parsed again as a positional word.
+    if argv0_consumed || !cmd.is_no_binary_name_set() {
         raw_args.next_os(&mut cursor);
     }
 
@@ -994,18 +1004,33 @@ fn possible_values(
 ///
 /// Subcommand `rustup toolchain install` would be converted to
 /// `("install", "rustup toolchain install")`.
+///
+/// Hidden aliases of a *visible* subcommand are not offered at all: the alias
+/// still selects the subcommand when typed exactly, but an empty word or name
+/// prefix must never reveal it. Hidden subcommands themselves, including their
+/// aliases, remain discoverable once no visible name matches the typed word.
 fn subcommands(p: &clap::Command) -> Vec<CompletionCandidate> {
     debug!("subcommands: name={}", p.get_name());
     debug!("subcommands: Has subcommands...{:?}", p.has_subcommands());
     p.get_subcommands()
         .flat_map(|sc| {
-            sc.get_name_and_visible_aliases()
+            let mut candidates: Vec<_> = sc
+                .get_name_and_visible_aliases()
                 .into_iter()
                 .map(|s| populate_command_candidate(s, p, sc))
-                .chain(
+                .collect();
+            if sc.is_hide_set() {
+                // A hidden subcommand and all of its aliases are offered only
+                // when no visible name matches the typed word.
+                candidates.extend(
                     sc.get_aliases()
                         .map(|s| populate_command_candidate(s, p, sc).hide(true)),
-                )
+                );
+            }
+            // For a visible subcommand, its hidden aliases are never suggested
+            // (empty word or name prefix); the parser still accepts the exact
+            // spelling to select the subcommand.
+            candidates
         })
         .collect()
 }
