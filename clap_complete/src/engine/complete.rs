@@ -166,7 +166,10 @@ pub fn complete(
             );
         }
 
-        if !is_escaped && !matches!(current_state, ParseState::Opt(..) | ParseState::Pos(..)) {
+        if !is_escaped
+            && !matches!(current_state, ParseState::Opt(..) | ParseState::Pos(..))
+            && !exclusive_committed(current_cmd, &used_args)
+        {
             if let Ok(value) = arg.to_value() {
                 if let Some(next_cmd) = current_cmd.find_subcommand(value) {
                     current_cmd = next_cmd;
@@ -555,6 +558,15 @@ fn complete_arg(
         state
     );
     let mut completions = Vec::<CompletionCandidate>::new();
+
+    if completion_locked_by_exclusive(cmd, &state, used_args, arg) {
+        // A committed exclusive argument forbids every other word at this
+        // level: no options, positionals, or subcommands can follow it, so any
+        // suggestion would describe a command line the parser must reject. The
+        // only exception is the exclusive option's own still-pending value.
+        debug!("complete_arg: locked by an exclusive argument");
+        return Ok(completions);
+    }
 
     match state {
         ParseState::ValueDone => {
@@ -1160,6 +1172,44 @@ fn filter_unavailable_args(
                 .is_some_and(|used| args_conflict(cmd, arg, used))
         })
     });
+}
+
+/// Whether an exclusive argument at `cmd` has already been committed.
+///
+/// `used_args` is reset on subcommand descent, so an exclusive argument from a
+/// parent command never locks a child scope.
+fn exclusive_committed(cmd: &clap::Command, used_args: &[clap::Id]) -> bool {
+    used_args.iter().any(|id| {
+        cmd.get_arguments()
+            .find(|a| a.get_id() == id)
+            .is_some_and(|a| a.is_exclusive_set())
+    })
+}
+
+/// Whether the cursor must offer nothing because an exclusive argument was
+/// already committed at this level.
+///
+/// An exclusive argument forbids every other word on the same command, so
+/// once one is committed no option, positional value, or subcommand can be
+/// suggested: every such candidate would describe a command line the parser
+/// must reject. This covers an empty word, an ordinary word, and a flag-like
+/// word alike. The sole exception is the exclusive option's own value while it
+/// is still pending and the cursor word is not starting another argument.
+fn completion_locked_by_exclusive(
+    cmd: &clap::Command,
+    state: &ParseState<'_>,
+    used_args: &[clap::Id],
+    arg: &clap_lex::ParsedArg<'_>,
+) -> bool {
+    if !exclusive_committed(cmd, used_args) {
+        return false;
+    }
+    if let ParseState::Opt(opt_state) = state {
+        if opt_state.opt.is_exclusive_set() && !is_flag_like(arg) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Record an argument seen on the command line, keeping the first occurrence
